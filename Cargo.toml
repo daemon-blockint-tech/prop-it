@@ -5,6 +5,10 @@ members = [
     "programs/txline-mock",
 ]
 
+# Cargo.lock is pinned for Solana 1.18 / cargo-build-sbf (rustc 1.75).
+# Keep lockfile version = 3. Prefer `cargo update -p <crate> --precise`
+# over a full unlock when bumping deps.
+
 [profile.release]
 overflow-checks = true
 lto = "fat"

@@ -56,7 +56,7 @@ const txlineDefaults = TXLINE_ADDRESSES[txlineCluster];
 // declare_id! placeholder is fine; on devnet/mainnet you MUST override.
 const tabulaProgramId = optionalPubkey(
   "TABULA_PROGRAM_ID",
-  "TabuLA11111111111111111111111111111111111111",
+  "GZ6F2Q5DWQopyxcyTQk7Jko58Fc9jPdEdGdfiSZS7Z9T",
 )!;
 
 // TxLINE program id — defaults to the canonical devnet/mainnet address
@@ -64,7 +64,7 @@ const tabulaProgramId = optionalPubkey(
 const txlineProgramId = optionalPubkey(
   "TXLINE_PROGRAM_ID",
   cluster === "localnet"
-    ? "TxLiNe11111111111111111111111111111111111111"
+    ? "9zs9jxdsjQigoKYpUuUYfBz5fdym3xXgdQa4twEjCYr"
     : txlineDefaults.programId.toBase58(),
 )!;
 
@@ -83,6 +83,7 @@ export const cfg = {
                                  "https://api.mainnet-beta.solana.com"
   ),
   oracleUrl: process.env.ORACLE_URL ?? "http://127.0.0.1:8787",
+  oracleApiKey: process.env.TABULA_ORACLE_API_KEY ?? "",
 
   // TxLINE REST/SSE
   txlineApiBase:    process.env.TXLINE_API_BASE    ?? txlineDefaults.apiBase,

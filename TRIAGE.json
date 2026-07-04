@@ -1,0 +1,754 @@
+{
+  "target": "/Users/macbook/DAEMON_BLOCKINT_TECHNOLOGIES/prop-it",
+  "source": "VULN-FINDINGS.json",
+  "triaged_at": "2026-07-04T04:57:22Z",
+  "method": "3-vote static verification (independent agents A/B/C, majority)",
+  "focus_areas": [
+    "On-chain trading & LMSR (place_bet / claim / vault)",
+    "On-chain settlement & TxLINE CPI",
+    "On-chain auth & admin (oracle_authority, pause, rotate)",
+    "Oracle FastAPI (TabFM)",
+    "Keeper bridge (TxLINE \u2194 Solana)",
+    "Frontend (wallet UI / receipts)"
+  ],
+  "findings": [
+    {
+      "id": "F-003",
+      "file": "programs/tabula-markets/src/lib.rs",
+      "line": 266,
+      "category": "logic-bug",
+      "severity": "HIGH",
+      "confidence": 1.0,
+      "title": "Share mint pays $1/share while price can be ~1/Q_SCALE, enabling vault drain",
+      "description": "place_bet treats market.probs[i] as a fixed marginal price and mints shares = usdc_amount * Q_SCALE / price_scaled (lines 254\u2013274), where price_scaled = p_i * (10000+FEE_BPS)/10000. claim_winnings pays gross = position.shares in USDC base units (lines 423\u2013430, 453), i.e. $1 per share. For the minimum allowed non-zero p_i = 1, integer division yields price_scaled = 1, so shares = usdc_amount * 1_000_000. A 1 USDC stake mints ~1_000_000 USDC of claimable liability. liquidity_b and market.q are stored/updated but never used in pricing or payout, so there is no LMSR cost-function bound on outstanding liability.",
+      "exploit_scenario": "LP vault holds \u22651M USDC. Attacker creates or uses a market with probs[j]=1, calls place_bet(outcome_idx=j, usdc_amount=1_000_000), receives ~1e12 shares, then after that outcome resolves calls claim_winnings and withdraws ~1M USDC for a 1 USDC cost (minus settlement fee on net winnings).",
+      "recommendation": "Price shares with a real LMSR cost function using q and b so cost(\u0394q) is paid in USDC and winning shares redeem at $1 with inventory-consistent liabilities. Reject p_i below a minimum that keeps max leverage within vault capital.",
+      "confidence_reason": "shares = usdc*Q_SCALE/price_scaled with p_i=1 \u2192 price_scaled=1 (FEE_BPS int-div), claim pays shares as USDC (minus settle fee on net).",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Share mint vs $1/share claim is live vault-drain math.",
+      "owner_hint": "on-chain",
+      "latent": false,
+      "related": [
+        "F-001",
+        "F-002",
+        "F-011",
+        "F-014"
+      ],
+      "patch_priority": 1
+    },
+    {
+      "id": "F-005",
+      "file": "programs/tabula-markets/src/lib.rs",
+      "line": 607,
+      "category": "account-confusion",
+      "severity": "HIGH",
+      "confidence": 1.0,
+      "title": "update_prediction binds oracle to an arbitrary pool, not to the market",
+      "description": "Market has no pool field (lines 776\u2013788), and market PDAs are seeded only as [b\"market\", match_id]. UpdatePrediction requires oracle to sign and checks oracle.key() == pool.oracle_authority, but never constrains that market belongs to pool. Pool PDAs are per-mint ([b\"pool\", usdc_mint]). An untrusted caller can create any SPL mint, call initialize_pool with themselves as oracle_authority, then invoke update_prediction with that attacker-controlled pool and any victim market.",
+      "exploit_scenario": "Victim pool exists for real USDC with honest oracle_authority. Attacker creates mint M', calls initialize_pool(M', oracle_authority=attacker). Attacker calls update_prediction with pool=attacker_pool, market=victim_market, and extreme new_probs. Victim market prices move; attacker place_bets on the mispriced side against the shared LP vault.",
+      "recommendation": "Store pool: Pubkey on Market at create_market. Seed markets as [b\"market\", pool.key(), match_id]. On UpdatePrediction, add constraint = market.pool == pool.key(). Authorize against that pool's oracle_authority only.",
+      "confidence_reason": "Auth is oracle == pool.oracle_authority only; Market has no pool field and UpdatePrediction never links market to pool, so any self-owned pool works.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Missing market.pool lets any-pool oracle reprice any market.",
+      "owner_hint": "on-chain",
+      "latent": false,
+      "related": [
+        "F-006",
+        "F-013"
+      ],
+      "patch_priority": 2
+    },
+    {
+      "id": "F-006",
+      "file": "programs/tabula-markets/src/lib.rs",
+      "line": 677,
+      "category": "privilege-escalation",
+      "severity": "HIGH",
+      "confidence": 1.0,
+      "title": "Settlement oracle of any pool can resolve any market and drain victim vault",
+      "description": "Same missing market\u2194pool binding. Under real-txline, post_txline_attestation and settle_via_txline only check that settlement_oracle matches the supplied pool.settlement_oracle. Attestation PDA seeds are [b\"attestation\", market.key()] with no pool key. ClaimWinnings also does not bind market to pool; it pays from vault derived from the supplied pool. An attacker who inits a pool with themselves as settlement_oracle can attest and resolve any market to a chosen bin, then claim from the victim pool vault by passing the victim pool into claim_winnings.",
+      "exploit_scenario": "Attacker inits pool for mint M' with settlement_oracle = attacker. Attacker place_bets on victim market outcome i via the real USDC pool/vault. Attacker post_txline_attestation + settle_via_txline with attacker pool, choosing stat_value in bin i. Market status becomes Resolved. Attacker claim_winnings with the real USDC pool and vault \u2192 drains LP funds.",
+      "recommendation": "Bind each market to exactly one pool (field + PDA seeds). On PostTxLineAttestation, SettleViaTxLineReal, and ClaimWinnings, require market.pool == pool.key(). Ensure pause is evaluated for the market's home pool.",
+      "confidence_reason": "Real attest/settle check oracle against the passed pool only; claim_winnings pays from the passed pool vault with the same unbound market, so attacker-pool resolve + victim-pool claim drains.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Any-pool settlement_oracle resolves market; claim from victim vault.",
+      "owner_hint": "on-chain",
+      "latent": false,
+      "related": [
+        "F-005",
+        "F-013",
+        "F-004"
+      ],
+      "patch_priority": 3
+    },
+    {
+      "id": "F-001",
+      "file": "programs/tabula-markets/src/lib.rs",
+      "line": 129,
+      "category": "auth-bypass",
+      "severity": "HIGH",
+      "confidence": 1.0,
+      "title": "Permissionless create_market allows attacker-chosen probabilities",
+      "description": "create_market is callable by any signer (CreateMarket.creator) with no pool.authority or oracle check. The creator supplies initial_probs subject only to sum \u2248 Q_SCALE (\u00b1 outcome_count). A two-outcome market with initial_probs = [1, Q_SCALE-1] is valid and sets p_0 = 1, enabling the share-mint vault drain (F-002). Markets are not bound to a pool in state (Market has no pool field); PlaceBet/ClaimWinnings pair any market PDA with the single pool vault for the USDC mint, so one malicious market taxes the whole LP vault. Untrusted inputs: initial_probs, bin_edges, match_id, outcome_count. Path: create_market \u2192 place_bet share mint \u2192 settle \u2192 claim_winnings vault transfer.",
+      "exploit_scenario": "Attacker calls create_market(match_id, \u2026, initial_probs=[1, 999_999], liquidity_b=1), bets the minimum USDC on outcome 0, waits for (or influences via settlement path) outcome 0 to win, and claims a payout orders of magnitude above stake from the shared vault.",
+      "recommendation": "Restrict create_market to pool.authority or oracle_authority; store pool on Market and constrain PlaceBet/ClaimWinnings to that pool; enforce a minimum per-outcome probability and/or maximum shares-per-USDC at creation time.",
+      "confidence_reason": "CreateMarket is any signer + unpaused pool; initial_probs only need sum\u2248Q_SCALE so p_i=1 is valid; Market has no pool field and vault is pool-scoped.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Permissionless create_market accepts attacker probs; enables F-003 drain.",
+      "owner_hint": "on-chain",
+      "latent": false,
+      "related": [
+        "F-002",
+        "F-003",
+        "F-011",
+        "F-014"
+      ],
+      "patch_priority": 4
+    },
+    {
+      "id": "F-002",
+      "file": "programs/tabula-markets/src/lib.rs",
+      "line": 246,
+      "category": "logic-bug",
+      "severity": "HIGH",
+      "confidence": 1.0,
+      "title": "Exposure cap tracks stake-in, not payout liability",
+      "description": "MAX_MARKET_EXPOSURE is documented as a per-market USDC exposure ceiling to stop a market draining the shared LP vault. place_bet only does exposure += usdc_amount and requires new_exposure \u2264 MAX_MARKET_EXPOSURE (lines 247\u2013252). Outstanding claimable liability is position.shares (paid in claim_winnings at lines 423\u2013430), which can be up to ~Q_SCALE\u00d7 larger than usdc_amount when p_i is tiny. exposure is never increased by shares, never reduced on claim, and never compared to vault.amount or pool.total_liquidity.",
+      "exploit_scenario": "Attacker places bets on a near-zero-priced outcome. Each bet adds only usdc_amount to exposure (e.g. total exposure = 10 USDC) while minting ~10M USDC of shares. After resolution, claim_winnings pays shares from the shared vault, draining LP funds far beyond the exposure counter.",
+      "recommendation": "Track per-outcome (or max-outcome) liability as sum(shares) and require liability \u2264 min(MAX_MARKET_EXPOSURE, vault free capital). On each bet, delta_liability must pass the cap before minting.",
+      "confidence_reason": "exposure only adds usdc_amount against MAX_MARKET_EXPOSURE; liability is shares which can be ~Q_SCALE\u00d7 stake.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Exposure tracks stake-in only; liability is shares.",
+      "owner_hint": "on-chain",
+      "latent": false,
+      "related": [
+        "F-003",
+        "F-011"
+      ],
+      "patch_priority": 5
+    },
+    {
+      "id": "F-007",
+      "file": "programs/txline-mock/src/lib.rs",
+      "line": 27,
+      "category": "auth-bypass",
+      "severity": "HIGH",
+      "confidence": 1.0,
+      "title": "Unauthenticated publish_stat_root lets anyone anchor a malicious Merkle root",
+      "description": "publish_stat_root (lines 27\u201344) accepts any authority: Signer and inits the stat-root PDA for match_id with an arbitrary merkle_root. There is no allowlist, multisig, or program-level TxLINE key check\u2014only first writer wins via init. validate_stat then treats that root as authoritative. Tabula's mock settlement path CPIs into this program and resolves the market from the receipt. Trust boundary is therefore whoever first published stat-root for this match_id, not TxLINE.",
+      "exploit_scenario": "Attacker watches for a new market with match_id = M. Before any honest publisher, they call publish_stat_root(M, R) where R is the Merkle root of a tree containing a leaf for a V that maps to the outcome they bet on. They place bets, then call settle_via_txline with a valid proof. Market resolves to their bin and they claim_winnings.",
+      "recommendation": "Gate publish_stat_root on a fixed TxLINE authority (config PDA / upgrade authority / hardcoded pubkey). Until then, treat mock settlement as fully attacker-controlled whenever the attacker can race publish_stat_root.",
+      "confidence_reason": "publish_stat_root only requires a signer; no authority/allowlist check before writing merkle_root for match_id.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Any signer publishes Merkle root; default mock settlement trusts it.",
+      "owner_hint": "on-chain-mock",
+      "latent": false,
+      "related": [
+        "F-016"
+      ],
+      "patch_priority": 6
+    },
+    {
+      "id": "F-004",
+      "file": "programs/tabula-markets/src/lib.rs",
+      "line": 373,
+      "category": "crypto-weakness",
+      "severity": "HIGH",
+      "confidence": 1.0,
+      "title": "real-txline settlement never verifies TxLINE; keeper attestation is sole trust root",
+      "description": "Under feature = \"real-txline\", settle_via_txline (lines 374\u2013408) does not CPI to TxODDS/txoracle, does not check a Merkle proof, and does not verify any signature over TxLINE transcript data. Instruction args _txodds_fixture_id, _txodds_seq, and _txodds_stat_key are unused. Checks are only: settlement_oracle signer equals pool.settlement_oracle, market still Trading, attestation age \u2264 MAX_RECEIPT_AGE_SEC, attestation match_id/stat_type/stat_value match, and attestation's stored oracle key matches pool. post_txline_attestation lets that same oracle write arbitrary stat_value into a per-market PDA.",
+      "exploit_scenario": "Compromised settlement_oracle (or malicious keeper) calls post_txline_attestation with V_attacker then settle_via_txline within 15 minutes. Market resolves to the bin containing V_attacker. Keeper's correlated positions claim vault funds. No on-chain check can detect that TxLINE never attested V_attacker.",
+      "recommendation": "On the production path, CPI into the real TxLINE/txoracle program (or verify an ed25519 signature over match_id, stat_type, stat_value, fixture_id, seq from a known TxLINE key). Do not treat keeper-written PDAs as evidence of Merkle validation.",
+      "confidence_reason": "real-txline settle only checks settlement_oracle + attestation PDA fields/freshness; no Merkle proof or TxODDS CPI (txodds_* args unused).",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "real-txline trusts settlement_oracle attestation only.",
+      "owner_hint": "on-chain",
+      "latent": false,
+      "related": [
+        "F-006"
+      ],
+      "patch_priority": 7
+    },
+    {
+      "id": "F-014",
+      "file": "programs/tabula-markets/src/lib.rs",
+      "line": 190,
+      "category": "logic-bug",
+      "severity": "HIGH",
+      "confidence": 0.9,
+      "title": "update_prediction can set near-zero prices and instantly underprice liability",
+      "description": "oracle_authority may set arbitrary new_probs and new_b with the same weak normalization as create_market (sum \u2248 Q_SCALE). new_b is written to liquidity_b but never read in place_bet. After an update that sets some p_i = 1, any bettor can mint maximal shares per USDC under F-003. Existing positions keep prior shares; only the pricing for new bets changes\u2014there is no re-marking or solvency check against vault balance.",
+      "exploit_scenario": "Compromised or buggy oracle posts new_probs with p_win = 1 for an outcome that is about to settle. Attacker place_bets into that outcome for a few USDC, mints huge shares, and after resolve drains the vault. Even an honest oracle lowering a longshot price creates a mempool race to buy underpriced liability.",
+      "recommendation": "When updating probs, enforce min p_i, recompute and enforce global liability vs vault equity, and/or pause betting around updates. Prefer LMSR inventory pricing so oracle probs steer b/prior without directly setting executable price to 1/Q_SCALE.",
+      "confidence_reason": "update_prediction (oracle-gated) can set any normalized probs including p_i=1, enabling the same mint/payout path as F-003.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "update_prediction can set p_i=1 enabling F-003 mint.",
+      "owner_hint": "on-chain",
+      "latent": false,
+      "related": [
+        "F-003",
+        "F-005"
+      ],
+      "patch_priority": 8
+    },
+    {
+      "id": "F-013",
+      "file": "programs/tabula-markets/src/lib.rs",
+      "line": 655,
+      "category": "logic-bug",
+      "severity": "MEDIUM",
+      "confidence": 1.0,
+      "title": "Market is not bound to Pool; pause and pool context are bypassable at settlement",
+      "description": "Market stores no pool pubkey. CreateMarket takes a pool account but never records it; market PDA seeds are only [b\"market\", match_id]. Both settlement account structs load an arbitrary pool PDA and an arbitrary market PDA with no constraint linking them. settle_via_txline only uses pool for require!(!pool.paused) and, on the real path, pool.settlement_oracle. A caller can pass any unpaused pool while resolving the global market for match_id.",
+      "exploit_scenario": "Admin pauses the main USDC pool after suspecting bad settlement data. Attacker uses another unpaused pool. On mock-txline, with a root they control (F-007), they settle the main market. When admin unpauses, winners of the forced outcome drain the main vault via claim_winnings.",
+      "recommendation": "Store pool on Market at creation and constrain market.pool == pool.key() in settle, claim, bet, and attestation accounts. Consider including pool.key() in market PDA seeds.",
+      "confidence_reason": "Market has no pool field; settle only requires !pool.paused on the passed pool, so any unpaused pool bypasses pause on the intended one.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Pause checked on caller-chosen pool; home-pool pause bypassable.",
+      "owner_hint": "on-chain",
+      "latent": false,
+      "related": [
+        "F-005",
+        "F-006"
+      ],
+      "patch_priority": 9
+    },
+    {
+      "id": "F-011",
+      "file": "programs/tabula-markets/src/lib.rs",
+      "line": 415,
+      "category": "logic-bug",
+      "severity": "MEDIUM",
+      "confidence": 1.0,
+      "title": "No vault solvency check before minting or paying; shared vault cross-market contagion",
+      "description": "deposit_liquidity credits pool.total_liquidity and transfers into the pool vault. place_bet also transfers stake into the same vault but never requires vault.amount \u2265 outstanding shares on any outcome. claim_winnings transfers payout with only PDA signer seeds, with no accounting debit to total_liquidity/exposure/fees_accrued. All markets share one vault per pool. Insolvency in one market's share inventory competes for the entire LP pot.",
+      "exploit_scenario": "LPs deposit 2M USDC. Attacker over-mints 1.5M USDC liability on market A via F-001\u2013F-003 and claims after A resolves, emptying most of the vault. Honest winners on market B then fail token::transfer or receive nothing.",
+      "recommendation": "Maintain reserved_liability per market and globally; place_bet must require vault.amount \u2265 reserved_liability + new_shares. On claim, debit reserves and total_liquidity. Consider per-market vaults.",
+      "confidence_reason": "claim_winnings transfers payout with no vault.amount check; markets unbound to pools so one vault backs many markets.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "No vault solvency vs share liability; cross-market contagion.",
+      "owner_hint": "on-chain",
+      "latent": false,
+      "related": [
+        "F-002",
+        "F-003"
+      ],
+      "patch_priority": 10
+    },
+    {
+      "id": "F-016",
+      "file": "programs/tabula-markets/src/lib.rs",
+      "line": 338,
+      "category": "auth-bypass",
+      "severity": "MEDIUM",
+      "confidence": 0.9,
+      "title": "Mock settle_via_txline is permissionless; any holder of a valid proof can resolve",
+      "description": "SettleViaTxLineMock requires only payer: Signer. Unlike the real path, there is no settlement_oracle check. Any account that can supply a proof accepted by txline_mock::validate_stat can move a market from Trading to Resolved. Combined with F-007 (open publish_stat_root), permissionless settle means there is no second gate before vault payouts become claimable.",
+      "exploit_scenario": "After publishing a malicious root (F-007), attacker does not need the pool's settlement_oracle key. They submit settle_via_txline as an ordinary payer as soon as their bets are booked.",
+      "recommendation": "If mock mode is only for demos, document that it is not production-safe. For any shared validator/devnet value, either require settlement_oracle on the mock path as well, or fix F-007 and add an optional allowlist/timelock before resolve_market.",
+      "confidence_reason": "Mock settle_via_txline only requires a signer payer; publish_stat_root is also ungated, so a first-writer root + proof fully controls resolution.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Mock settle permissionless; with F-007 anyone resolves.",
+      "owner_hint": "on-chain",
+      "latent": false,
+      "related": [
+        "F-007"
+      ],
+      "patch_priority": 11
+    },
+    {
+      "id": "F-012",
+      "file": "programs/tabula-markets/src/lib.rs",
+      "line": 526,
+      "category": "privilege-escalation",
+      "severity": "MEDIUM",
+      "confidence": 1.0,
+      "title": "Permissionless initialize_pool allows front-running canonical mint authority",
+      "description": "InitializePool lets any signer create the sole pool PDA for a given usdc_mint (seeds = [b\"pool\", usdc_mint.key()]) and set authority, oracle_authority, and settlement_oracle with no allowlist, multisig, or one-time deployer gate. If the intended operator does not atomically deploy + initialize for the production USDC mint, an attacker can init first and fully control set_paused / rotate_oracle.",
+      "exploit_scenario": "Program is deployed; operators plan a later initialize_pool for mainnet USDC. Attacker observes deploy and submits initialize_pool with attacker as authority and both oracles. Honest team cannot create the intended pool PDA for that mint.",
+      "recommendation": "Initialize in the same transaction as deployment, or require a fixed deployer pubkey / multisig as authority signer constraint, or use a config PDA initialized once by program upgrade authority.",
+      "confidence_reason": "initialize_pool is open to any signer and pool PDA is [b\"pool\", usdc_mint], so first writer owns that mint's pool.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "First-writer initialize_pool owns mint's authority and oracles.",
+      "owner_hint": "on-chain",
+      "latent": false,
+      "related": [
+        "F-005",
+        "F-006"
+      ],
+      "patch_priority": 12
+    },
+    {
+      "id": "F-008",
+      "file": "oracle/tabula_oracle/server.py",
+      "line": 172,
+      "category": "auth-bypass",
+      "severity": "HIGH",
+      "confidence": 1.0,
+      "title": "Unauthenticated /predict returns pricing vectors that feed on-chain LMSR",
+      "description": "POST /predict has no authentication, authorization, mTLS, API key, or request/response signing. Any network client that can reach the process may submit fully attacker-controlled history, live, bin_edges, and base_b and receive probs_q6 and liquidity_b. Architecture states these values are consumed by the keeper and written on-chain via update_prediction. Default listen address is 0.0.0.0; Uvicorn is started without TLS.",
+      "exploit_scenario": "Oracle is reachable (default bind, misconfigured compose port, shared VPC). Attacker POSTs crafted /predict bodies to map TabFM outputs, or MITMs keeper\u2192oracle HTTP and returns probs_q6 concentrated on an outcome they are buying so the keeper's next update_prediction misprices the market.",
+      "recommendation": "Require a shared secret (Bearer/API key) or mTLS on /predict; terminate TLS between keeper and oracle; bind to 127.0.0.1 by default; optionally sign responses and verify in the keeper.",
+      "confidence_reason": "/predict has no auth/middleware and _run_uvicorn defaults HOST to 0.0.0.0.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Unauthenticated /predict on 0.0.0.0 is a live API surface.",
+      "owner_hint": "oracle",
+      "latent": false,
+      "related": [
+        "F-009",
+        "F-021",
+        "F-025"
+      ],
+      "patch_priority": 13
+    },
+    {
+      "id": "F-010",
+      "file": "app/src/components/ReceiptPanel.tsx",
+      "line": 20,
+      "category": "logic-bug",
+      "severity": "MEDIUM",
+      "confidence": 1.0,
+      "title": "Receipt UI presents hardcoded mock Merkle data as authentic on-chain settlement proof",
+      "description": "ReceiptPanel is marketed as Verifiable Resolution / TxLINE data receipt. loadDemoReceipt never reads chain state, never calls an RPC, and never runs keccak/Merkle verification. It always injects fixed client-side values (stat_value: 5, ellipsized merkle_root / tx_signature, and three static sibling hashes including 0xdeadbeef\u2026). The UI renders those fields as a real receipt and only tells the user to Verify yourself without performing or gating on any check.",
+      "exploit_scenario": "After a match, a user clicks Fetch receipt expecting cryptographic assurance. The app always shows stat_value = 5 and a fabricated proof/root/tx, regardless of on-chain truth, inducing false confidence that settlement was verified.",
+      "recommendation": "Load receipt fields from on-chain StatReceipt / StatRoot PDAs, recompute the leaf and walk the Merkle path in the browser, or show a clear unverified demo banner and fail closed with INVALID if proof does not match.",
+      "confidence_reason": "loadDemoReceipt hardcodes stat_value/merkle_root/proof/tx_signature; UI copy presents them as on-chain TxLINE receipts with no chain read or verify.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Hardcoded receipt presented as on-chain proof without demo label.",
+      "owner_hint": "frontend",
+      "latent": false,
+      "related": [],
+      "patch_priority": 14
+    },
+    {
+      "id": "F-017",
+      "file": "oracle/tabula_oracle/tabfm_engine.py",
+      "line": 111,
+      "category": "integrity-failure",
+      "severity": "MEDIUM",
+      "confidence": 0.9,
+      "title": "Load failure silently falls back to deterministic mock while still reporting ready",
+      "description": "On ModuleNotFoundError or any other load exception, _load sets self._backend = \"mock\" and continues. There is no fail-closed mode: the process still serves /predict via _mock_predict. /readyz treats any non-\"unloaded\" backend as ready, so mock is ready. Mock probabilities are fully deterministic given inputs.",
+      "exploit_scenario": "TabFM fails to load (OOM, missing extra, HF failure). Oracle keeps serving. Attacker polls unauthenticated /health, sees mock, then reproduces _mock_predict offline and trades against the mis-specified LMSR.",
+      "recommendation": "Fail closed in production: if TabFM cannot load, exit non-zero or set backend to a non-ready state and return 503 from /predict and /readyz. Have the keeper refuse model_backend == \"mock\" before submitting update_prediction.",
+      "confidence_reason": "Load errors set backend = mock; /readyz is ready whenever backend is not unloaded (logs exist, so not fully silent).",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Load failure falls back to mock while /readyz stays ready.",
+      "owner_hint": "oracle",
+      "latent": false,
+      "related": [
+        "F-008",
+        "F-021"
+      ],
+      "patch_priority": 15
+    },
+    {
+      "id": "F-009",
+      "file": "keeper/src/oracle.ts",
+      "line": 41,
+      "category": "logic-bug",
+      "severity": "HIGH",
+      "confidence": 1.0,
+      "title": "Oracle /predict response trusted without schema or economic validation",
+      "description": "callOracle posts to ORACLE_URL/predict and returns data as PredictResponse with no checks. index.ts uses the response for drift, metrics, and the submit path (would.submit.update_prediction). Nothing verifies probs_q6 length vs bin_edges, sum \u2248 Q_SCALE, non-negative probs, liquidity_b bounds, or match_id echo. Note: Anchor signing is still TODO, but the trust boundary is already established for when signing is wired.",
+      "exploit_scenario": "Attacker compromises TabFM or intercepts oracle HTTP. They return skewed probs_q6. Once the keeper wires Anchor update_prediction, it signs and posts those probs, moving LMSR prices in the attacker's favor.",
+      "recommendation": "Validate response shape and invariants before any signing: length, Q6 sum within on-chain tolerance, liquidity_b > 0, match_id binding. Pin oracle identity (mTLS / signed responses).",
+      "confidence_reason": "callOracle returns data as PredictResponse with no schema/economic checks; index.ts still has TODO and only logs would.submit.update_prediction.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Unvalidated oracle response; on-chain impact when submit TODO removed.",
+      "owner_hint": "keeper",
+      "latent": true,
+      "related": [
+        "F-008",
+        "F-015"
+      ],
+      "patch_priority": 16
+    },
+    {
+      "id": "F-015",
+      "file": "keeper/src/index.ts",
+      "line": 82,
+      "category": "logic-bug",
+      "severity": "HIGH",
+      "confidence": 0.9,
+      "title": "TxLINE SSE live stats drive predictions with no integrity checks",
+      "description": "In runRealFeed, SSE payloads from TxLineClient.streamScores() are cast to any and filtered only by fixtureId. Live features are taken with ?? defaults and passed into callOracle. txlineClient.ts parses SSE data: lines with JSON.parse and yields them unchecked. There is no signature, sequence monotonicity, timestamp freshness, or range validation on live fields.",
+      "exploit_scenario": "Attacker with ability to poison the scores stream (or a malicious TxLINE response) sends fixtureId matching TXODDS_FIXTURE_ID with fabricated cornersSoFar / minute. Keeper calls oracle on false live state and, when wired, signs a misleading market update.",
+      "recommendation": "Treat SSE as untrusted input: validate types/ranges, enforce seq/timestamp monotonicity per fixture, cross-check snapshots via fetchScoresSnapshot, and require authenticated/paid tokens for production.",
+      "confidence_reason": "streamScores yields JSON.parse payloads; runRealFeed treats them as any with defaults and feeds them into callOracle with no integrity checks.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Unvalidated SSE feeds callOracle; dangerous once submit wired.",
+      "owner_hint": "keeper",
+      "latent": true,
+      "related": [
+        "F-009"
+      ],
+      "patch_priority": 17
+    },
+    {
+      "id": "F-018",
+      "file": "keeper/src/metrics.ts",
+      "line": 58,
+      "category": "auth-bypass",
+      "severity": "MEDIUM",
+      "confidence": 0.9,
+      "title": "Unauthenticated metrics/health bind all interfaces and leak prediction timing",
+      "description": "startMetricsServer creates an HTTP server with no authentication and listens on cfg.metricsPort with no host bind (Node defaults to all interfaces). /metrics exposes tabula_last_prediction_ms, tabula_ensemble_divergence, prediction/settlement counters, and match labels. index.ts updates lastPredictionMs and ensembleDivergence on every successful oracle response, before the drift gate and the intended update_prediction submit.",
+      "exploit_scenario": "Attacker on the same VPC/host network scrapes http://keeper:9464/metrics. When tabula_last_prediction_ms advances and divergence is high, they race bets before the keeper's update_prediction lands.",
+      "recommendation": "Bind metrics to 127.0.0.1 (or a private scrape network), require mTLS/bearer auth, and avoid exporting pre-submit timing/divergence on a public interface.",
+      "confidence_reason": "srv.listen(cfg.metricsPort) binds all interfaces with no auth; /metrics exposes tabula_last_prediction_ms and tabula_ensemble_divergence.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Unauth metrics leak pre-submit timing; impact rises when submit wired.",
+      "owner_hint": "keeper",
+      "latent": true,
+      "related": [
+        "F-009"
+      ],
+      "patch_priority": 18
+    },
+    {
+      "id": "F-021",
+      "file": "oracle/tabula_oracle/server.py",
+      "line": 155,
+      "category": "information-disclosure",
+      "severity": "LOW",
+      "confidence": 0.9,
+      "title": "Unauthenticated /metrics, /model, and /health expose backend and operational state",
+      "description": "GET /metrics, GET /model, and GET /health are unauthenticated. They reveal whether the live backend is tabfm-pytorch vs mock, device, ensemble size, model id, and Prometheus series. FastAPI's default /docs and /openapi.json are also enabled, documenting the full predict schema to any client.",
+      "exploit_scenario": "Attacker discovers the oracle port, reads /health or /metrics, learns the service is on mock (or under load), then prioritizes front-running or timing attacks around predict latency patterns.",
+      "recommendation": "Keep probes on a separate internal listener or protect /metrics and /model with the same auth as /predict. Disable OpenAPI UI in production.",
+      "confidence_reason": "/health, /model, and /metrics are open and return backend (and related mode metadata).",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Unauth health/model/metrics expose backend mode.",
+      "owner_hint": "oracle",
+      "latent": false,
+      "related": [
+        "F-008",
+        "F-017"
+      ],
+      "patch_priority": 19
+    },
+    {
+      "id": "F-025",
+      "file": "oracle/tabula_oracle/server.py",
+      "line": 79,
+      "category": "input-validation",
+      "severity": "LOW",
+      "confidence": 0.7,
+      "title": "Unbounded score_diff and client-chosen base_b fully steer model outputs",
+      "description": "LiveState.score_diff and inherited HistoryRow.score_diff have no ge/le bounds (unlike minute, possession, etc.). base_b accepts up to 10_000_000_000 and flows into dynamic_b, directly controlling returned liquidity_b. Combined with F-008, any client can push extreme feature values into TabFM's in-context fit to search for adversarial probability mass. Note: base_b is bounded (ge=1, le=10_000_000_000), so it is client-chosen but not fully unbounded.",
+      "exploit_scenario": "Unauthenticated client sweeps extreme score_diff / history compositions and base_b values against /predict to find feature settings that maximize probability on a chosen bin, then uses that mapping when poisoning keeper inputs or forging responses.",
+      "recommendation": "Bound score_diff to realistic ranges. Cap base_b to an operator-configured allowlist (or ignore client base_b). Add sanity checks on returned probs_q6 in the keeper.",
+      "confidence_reason": "score_diff is unbounded and inputs are client-chosen, but base_b is constrained (ge=1, le=10_000_000_000), so unbounded overstates that field.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Client-chosen features/base_b steer unauthenticated /predict.",
+      "owner_hint": "oracle",
+      "latent": false,
+      "related": [
+        "F-008"
+      ],
+      "patch_priority": 20
+    },
+    {
+      "id": "F-026",
+      "file": "keeper/src/txlineClient.ts",
+      "line": 83,
+      "category": "secrets-in-logs",
+      "severity": "LOW",
+      "confidence": 0.7,
+      "title": "HTTP error bodies embedded in exceptions; log redaction misses opaque API tokens",
+      "description": "Failed TxLINE calls throw Error strings that include await res.text() (guest-start, activate, stat-validation). Callers log failures as String(e). activateApiToken also returns the raw apiToken to the caller. log.ts redacts JWT-shaped strings, sk-\u2026, long base58, and \"secretKey\": [\u2026] but not opaque X-Api-Token values or arbitrary bearer tokens.",
+      "exploit_scenario": "TxLINE returns an error page or JSON that echoes the Authorization header or apiToken. Keeper logs failures; operator log drain is readable by a lower-privileged role, which reuses the token.",
+      "recommendation": "Do not append full response bodies to errors; log status codes only. Never return/log apiToken/jwt. Extend redaction for apiToken, X-Api-Token, and Bearer values.",
+      "confidence_reason": "Guest/activate/stat-validation errors embed await res.text(); log redacts JWT/sk-/long base58/secretKey arrays but not opaque apiToken-style values.",
+      "verdict": "true_positive",
+      "votes": [
+        "true_positive",
+        "true_positive",
+        "true_positive"
+      ],
+      "vote_rationale": "Error bodies may leak tokens; redaction incomplete.",
+      "owner_hint": "keeper",
+      "latent": false,
+      "related": [],
+      "patch_priority": 21
+    },
+    {
+      "id": "F-023",
+      "file": "keeper/src/txlineClient.ts",
+      "line": 138,
+      "category": "crypto-weakness",
+      "severity": "HIGH",
+      "confidence": 0.8,
+      "title": "fetchStatValidation returns API proofs/stat values with no local verification",
+      "description": "fetchStatValidation GETs /scores/stat-validation and returns StatValidationResponse (roots, proofs, statToProve) typed but never verified. keeper/src/merkle.ts implements the mock verifier's leaf/sort-pair scheme but is not used by the client. On the real-txline program path, post_txline_attestation / settle_via_txline trust the keeper's settlement-oracle signature for stat_value without on-chain TxODDS proof checks. Settlement wiring to this API is latent (emulator path does not call it yet).",
+      "exploit_scenario": "Attacker compromises TxLINE stat-validation HTTP (or MITMs it). Response claims statToProve.statValue = N with fabricated proofs. Keeper posts post_txline_attestation / settles with N, resolving the market to the wrong bin.",
+      "recommendation": "Before any settlement attestation, locally verify Merkle proofs against an on-chain or independently anchored root. Never attest solely from REST JSON. Bind attestation to fixture id, seq, and stat key.",
+      "confidence_reason": "fetchStatValidation returns API proofs as-is with no local Merkle verify; settlement does not call it yet (emulator only logs), so REST-trust is latent, not live.",
+      "verdict": "needs_info",
+      "votes": [
+        "needs_info",
+        "needs_info",
+        "needs_info"
+      ],
+      "vote_rationale": "fetchStatValidation unused; settlement not wired to it.",
+      "owner_hint": "keeper",
+      "latent": false,
+      "related": [
+        "F-004"
+      ]
+    },
+    {
+      "id": "F-022",
+      "file": "app/src/app/page.tsx",
+      "line": 36,
+      "category": "logic-bug",
+      "severity": "LOW",
+      "confidence": 0.9,
+      "title": "Untrusted oracle JSON is rendered as authoritative market probabilities and odds",
+      "description": "fetchPrediction POSTs to ORACLE_URL and trusts response fields without schema, range, or attestation checks: probs_float, liquidity_b, ensemble_divergence, latency_ms, model_backend. Those values flow into priceWithFee, MarketPanel odds, and OracleStatus. Wallet place_bet is not implemented yet (MarketPanel only alerts), so this does not currently construct drainable transactions.",
+      "exploit_scenario": "Attacker controls or intercepts the oracle endpoint. They return probs_float skewed toward a bin they favor. The UI shows attractive decimal odds on that bin. When betting is wired to place_bet, users act on manipulated prices.",
+      "recommendation": "Treat oracle responses as untrusted: validate types/lengths, prefer HTTPS and authenticated/attested predictions, and use on-chain update_prediction account as source of truth for displayed prices.",
+      "confidence_reason": "page.tsx maps data.probs_float etc. into odds with no validation; MarketPanel bet clicks only alert(...) and do not call place_bet.",
+      "verdict": "false_positive",
+      "votes": [
+        "false_positive",
+        "false_positive",
+        "false_positive"
+      ],
+      "vote_rationale": "place_bet is alert-only; no fund path today.",
+      "owner_hint": "frontend",
+      "latent": false,
+      "related": [
+        "F-008"
+      ]
+    },
+    {
+      "id": "F-024",
+      "file": "programs/tabula-markets/src/lib.rs",
+      "line": 310,
+      "category": "integer-overflow",
+      "severity": "LOW",
+      "confidence": 0.7,
+      "title": "shares as i64 truncation when updating market.q",
+      "description": "place_bet does market.q[i] = market.q[i].checked_add(shares as i64). shares is u64; the as i64 cast truncates values > i64::MAX to a negative i64 without a checked conversion. Today q is never read for pricing or payout (dead inventory), so funds are not directly affected\u2014but any future LMSR using q would inherit corrupted state.",
+      "exploit_scenario": "If pricing is later wired to q without fixing the cast, an attacker mints shares > i64::MAX (possible with tiny p_i and large stake), corrupts q to a negative or wrapped value, and manipulates subsequent LMSR prices.",
+      "recommendation": "Use i128 for q inventory, or require shares \u2264 i64::MAX via try_from before add. Prefer computing cost in u128 throughout.",
+      "confidence_reason": "shares as i64 can wrap if shares>i64::MAX, but under MAX_MARKET_EXPOSURE max shares\u22481e18 fits i64; q is write-only and unused for pricing.",
+      "verdict": "false_positive",
+      "votes": [
+        "false_positive",
+        "false_positive",
+        "false_positive"
+      ],
+      "vote_rationale": "market.q unused for pricing/payout today.",
+      "owner_hint": "on-chain",
+      "latent": false,
+      "related": [
+        "F-003"
+      ]
+    },
+    {
+      "id": "F-020",
+      "file": "programs/tabula-markets/src/lib.rs",
+      "line": 559,
+      "category": "auth-bypass",
+      "severity": "LOW",
+      "confidence": 0.9,
+      "title": "AdminOnly relies on body checks only; no has_one on pool.authority",
+      "description": "AdminOnly marks authority as Signer and validates the pool PDA seeds, but does not use has_one = authority. Authorization is only in instruction bodies via require_keys_eq!(authority, pool.authority) for set_paused and rotate_oracle. Both current admin entrypoints perform the check, so there is no live bypass today. The pattern is fragile: any future instruction reusing AdminOnly without copying the body check would be fully callable by any signer.",
+      "exploit_scenario": "A later admin instruction is added with Context<AdminOnly> but omits require_keys_eq. Any wallet can pause the pool or rotate oracles.",
+      "recommendation": "Add has_one = authority on pool in AdminOnly (with authority: Signer), and remove redundant body checks or keep them as defense-in-depth.",
+      "confidence_reason": "AdminOnly has no has_one; set_paused / rotate_oracle do require_keys_eq on pool.authority today\u2014fragile, not currently open.",
+      "verdict": "false_positive",
+      "votes": [
+        "false_positive",
+        "false_positive",
+        "false_positive"
+      ],
+      "vote_rationale": "Body checks enforce pool.authority today; no live bypass.",
+      "owner_hint": "on-chain",
+      "latent": false,
+      "related": []
+    },
+    {
+      "id": "F-019",
+      "file": "programs/txline-mock/src/lib.rs",
+      "line": 59,
+      "category": "logic-bug",
+      "severity": "LOW",
+      "confidence": 0.9,
+      "title": "Merkle leaf omits match_id; safety depends entirely on StatRoot PDA binding",
+      "description": "Leaf preimage is only stat_type || stat_value.to_le_bytes(), not bound to match_id. Correctness relies on StatRoot PDA seeds [b\"stat-root\", match_id], receipt copying root.match_id, and Tabula checking account.match_id == market.match_id. Today Tabula checks match_id after CPI, so exploitability requires a regression or alternate consumer of validate_stat.",
+      "exploit_scenario": "A later integration settles market B while passing stat_root/receipt for match A where (stat_type, stat_value) also appears, and forgets the match_id equality check. The proof verifies and the wrong match's stat resolves market B.",
+      "recommendation": "Domain-separate leaves as keccak(match_id || stat_type || stat_value_le) so proofs are unusable under the wrong root even if account checks are incomplete.",
+      "confidence_reason": "Leaf is exactly keccak(stat_type || stat_value_le); match_id is only copied from the stat-root PDA into the receipt.",
+      "verdict": "false_positive",
+      "votes": [
+        "false_positive",
+        "false_positive",
+        "false_positive"
+      ],
+      "vote_rationale": "match_id checked after CPI today; future footgun only.",
+      "owner_hint": "on-chain-mock",
+      "latent": false,
+      "related": []
+    }
+  ],
+  "summary": {
+    "input": 26,
+    "true_positive": 21,
+    "false_positive": 4,
+    "needs_info": 1,
+    "duplicate": 0,
+    "latent_true_positive": 3,
+    "live_true_positive": 18
+  },
+  "fix_clusters": [
+    {
+      "name": "LMSR pricing / vault drain",
+      "primary": "F-003",
+      "members": [
+        "F-001",
+        "F-002",
+        "F-003",
+        "F-011",
+        "F-014"
+      ],
+      "note": "Implement real LMSR or min-price + liability caps; restrict create_market."
+    },
+    {
+      "name": "Market\u2194pool binding",
+      "primary": "F-005",
+      "members": [
+        "F-005",
+        "F-006",
+        "F-013"
+      ],
+      "note": "Store pool on Market; constrain all privileged and payout instructions."
+    },
+    {
+      "name": "Settlement trust",
+      "primary": "F-007",
+      "members": [
+        "F-004",
+        "F-007",
+        "F-016"
+      ],
+      "note": "Gate mock publish_stat_root; CPI/verify TxLINE on real path."
+    },
+    {
+      "name": "Oracle/keeper integrity",
+      "primary": "F-008",
+      "members": [
+        "F-008",
+        "F-009",
+        "F-015",
+        "F-017",
+        "F-021",
+        "F-025"
+      ],
+      "note": "Auth /predict; validate responses; fail-closed on mock; validate SSE before submit."
+    }
+  ]
+}

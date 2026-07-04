@@ -85,8 +85,9 @@ export function startMetricsServer() {
     }
     res.writeHead(404).end();
   });
-  srv.listen(cfg.metricsPort, () => {
-    log.info({ port: cfg.metricsPort }, "metrics.server.up");
+  // Bind loopback only — metrics must not be exposed on all interfaces.
+  srv.listen(cfg.metricsPort, "127.0.0.1", () => {
+    log.info({ port: cfg.metricsPort, host: "127.0.0.1" }, "metrics.server.up");
   });
   return srv;
 }

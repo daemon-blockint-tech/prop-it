@@ -2,12 +2,12 @@
 import React, { useState } from "react";
 
 /**
- * "Verifiable Resolution UI" — the differentiator called out in the PRD.
+ * DEMO / UNVERIFIED resolution UI.
  *
- * For the MVP we render a Merkle proof "receipt" derived from the local
- * keeper's mock TxLINE tree so users can inspect that the stat_value they
- * won / lost on was actually anchored on-chain, not fabricated by a
- * centralised server.
+ * This panel shows placeholder Merkle-proof-shaped data for product demos.
+ * It does **not** read on-chain accounts or verify proofs. Do not treat
+ * anything rendered here as settlement evidence until a real RPC verify
+ * path is wired.
  */
 export function ReceiptPanel({ matchId, statType }: { matchId: string; statType: string }) {
   const [receipt, setReceipt] = useState<null | {
@@ -18,9 +18,7 @@ export function ReceiptPanel({ matchId, statType }: { matchId: string; statType:
   }>(null);
 
   function loadDemoReceipt() {
-    // For the frontend-only demo we hardcode a receipt that mirrors what the
-    // keeper's `publishStat.ts` would emit. In a live cluster this comes
-    // from an RPC read of the StatReceipt PDA.
+    // Hardcoded demo payload only — not fetched from chain, not verified.
     setReceipt({
       stat_value: 5,
       merkle_root: "0x8f1d…c39a",
@@ -34,10 +32,19 @@ export function ReceiptPanel({ matchId, statType }: { matchId: string; statType:
   }
 
   return (
-    <div className="rounded-xl border border-white/10 bg-panel p-5">
+    <div className="rounded-xl border border-amber-500/40 bg-panel p-5">
+      <div className="mb-3 rounded-md bg-amber-500/15 border border-amber-500/30 px-3 py-2">
+        <p className="text-xs font-semibold text-amber-300 tracking-wide">
+          DEMO / UNVERIFIED — not on-chain proof
+        </p>
+        <p className="text-[11px] text-amber-200/70 mt-0.5">
+          This UI shows sample receipt-shaped data only. No Merkle verification or
+          PDA read is performed. Do not rely on it for payouts or dispute resolution.
+        </p>
+      </div>
       <div className="flex justify-between items-center mb-3">
         <div>
-          <p className="text-xs text-white/50">Verifiable Resolution</p>
+          <p className="text-xs text-white/50">Resolution receipt (demo)</p>
           <h2 className="text-lg font-semibold">TxLINE data receipt</h2>
           <p className="text-[11px] text-white/50 mt-1">
             match: <span className="font-mono">{matchId}</span> · stat: <span className="font-mono">{statType}</span>
@@ -47,16 +54,17 @@ export function ReceiptPanel({ matchId, statType }: { matchId: string; statType:
           className="text-xs rounded-md bg-accent text-black font-semibold px-3 py-2 hover:opacity-90"
           onClick={loadDemoReceipt}
         >
-          Fetch receipt
+          Load demo receipt
         </button>
       </div>
       {!receipt ? (
         <p className="text-xs text-white/40">
-          After full-time, click <span className="text-accent">Fetch receipt</span> to load the on-chain
-          Merkle proof written by TxLINE. This is what the smart contract used to release your USDC.
+          Click <span className="text-accent">Load demo receipt</span> to preview the
+          receipt layout. Live verification against the StatReceipt PDA is not implemented.
         </p>
       ) : (
         <div className="text-xs space-y-2 font-mono">
+          <p className="text-amber-300/90 font-sans font-semibold">Status: unverified demo data</p>
           <p>stat_value = <span className="text-accent">{receipt.stat_value}</span></p>
           <p>merkle_root = <span className="break-all">{receipt.merkle_root}</span></p>
           <details>
@@ -69,7 +77,7 @@ export function ReceiptPanel({ matchId, statType }: { matchId: string; statType:
             settle_via_txline tx: <span className="text-accent">{receipt.tx_signature}</span>
           </p>
           <p className="text-[10px] text-white/40 pt-1">
-            Verify yourself: keccak256 the leaf, sort-pair with each sibling, and compare to the anchored root.
+            Demo only — leaf hashing and root comparison are not run in this panel.
           </p>
         </div>
       )}

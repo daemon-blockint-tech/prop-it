@@ -15,6 +15,10 @@ If TabFM is not installable (CI runners without CUDA, laptops without
 enough RAM) set ``TABULA_ORACLE_MOCK=1`` to force the deterministic mock
 engine. The mock preserves the exact public surface of ``predict()`` so
 downstream services can be tested end-to-end.
+
+Fail-closed: when ``TABULA_ORACLE_MOCK`` is not ``1`` and TabFM fails to
+load, the backend is marked ``unloaded`` and ``predict()`` raises — the
+HTTP layer returns 503 rather than silently serving mock probabilities.
 """
 
 from __future__ import annotations
@@ -41,7 +45,7 @@ class PredictionResult:
     probs: np.ndarray            # shape (n_classes,), float in [0,1], sums to ~1
     ensemble_divergence: float   # mean pairwise TV distance across ensemble members
     latency_ms: float
-    backend: str                 # "tabfm-pytorch" | "mock"
+    backend: str                 # "tabfm-pytorch" | "mock" | "unloaded"
 
 
 def _resolve_device() -> str:
@@ -66,7 +70,7 @@ class TabFMEngine:
         self.ensemble_size = ensemble_size
         self.prefer_backend = prefer_backend
         self._clf = None
-        self._backend = "mock"
+        self._backend = "unloaded"
         self._device: str = "cpu"
         self._load()
 
@@ -84,16 +88,11 @@ class TabFMEngine:
             log.info("Loading TabFM v1.0.0 (PyTorch) on device=%s from %s …",
                      self._device, TABFM_MODEL_ID)
 
-            # Preferred entrypoint per the TabFM README:
-            #   from tabfm import TabFMClassifier
-            # In-context ensemble is constructed via ``ensemble_size=`` or the
-            # ``TabFMClassifier.ensemble(...)`` classmethod depending on wheel.
             from tabfm import TabFMClassifier                       # type: ignore
             try:
                 from tabfm import tabfm_v1_0_0_pytorch as _tabfm    # type: ignore
                 model = _tabfm.load(model_id=TABFM_MODEL_ID, device=self._device)
             except Exception:                                       # noqa: BLE001
-                # Older wheels expose a HF-only loader.
                 from tabfm.pytorch import TabFM_HF                  # type: ignore
                 model = TabFM_HF.from_pretrained(
                     TABFM_MODEL_ID, subfolder="classification"
@@ -109,14 +108,15 @@ class TabFMEngine:
             log.info("TabFM loaded — backend=%s ensemble=%d device=%s",
                      self._backend, self.ensemble_size, self._device)
         except ModuleNotFoundError as e:
-            log.warning(
-                "TabFM not installed (`pip install '.[tabfm]'` to enable). "
-                "Falling back to mock engine. err=%s", e,
+            log.error(
+                "TabFM not installed and TABULA_ORACLE_MOCK!=1 — fail closed. "
+                "Set TABULA_ORACLE_MOCK=1 for local/dev, or `pip install '.[tabfm]'`. err=%s",
+                e,
             )
-            self._backend = "mock"
+            self._backend = "unloaded"
         except Exception as e:                                       # noqa: BLE001
-            log.exception("TabFM load failed, falling back to mock: %s", e)
-            self._backend = "mock"
+            log.exception("TabFM load failed and TABULA_ORACLE_MOCK!=1 — fail closed: %s", e)
+            self._backend = "unloaded"
 
     # ------------------------------------------------------------------
     # Prediction
@@ -128,6 +128,9 @@ class TabFMEngine:
         live: pd.DataFrame,
         class_labels: List[int],
     ) -> PredictionResult:
+        if self._backend == "unloaded":
+            raise RuntimeError("oracle backend unloaded (TabFM failed to load)")
+
         t0 = time.perf_counter()
         if self._backend == "mock" or self._clf is None:
             probs, div = self._mock_predict(history, y_train, live, class_labels)
@@ -153,8 +156,6 @@ class TabFMEngine:
         self._clf.fit(history, y_train)
         proba = self._clf.predict_proba(live)[0]
 
-        # Per-member proba (for divergence). Different wheel versions expose
-        # this differently — probe common attribute names.
         div = 0.0
         member_probs: Optional[np.ndarray] = None
         for attr in ("ensemble_member_proba_", "member_proba_", "predict_proba_members"):

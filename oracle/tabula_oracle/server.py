@@ -1,10 +1,13 @@
 """FastAPI service exposing the TabFM engine to keeper bots and frontends.
 
 Production hardening:
-  * structured logging (json when LOG_JSON=1)
+  * optional Bearer API key (TABULA_ORACLE_API_KEY)
+  * bind 127.0.0.1 by default
+  * fail-closed when TabFM is unloaded
   * /metrics endpoint with Prometheus counters + histograms
   * /healthz + /readyz probes
   * strict request validation with 400-on-error
+  * OpenAPI docs disabled outside mock/dev mode
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     Counter,
@@ -55,6 +58,16 @@ else:
 log = logging.getLogger("tabula_oracle")
 
 # ----------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------
+API_KEY = os.environ.get("TABULA_ORACLE_API_KEY", "").strip()
+DEFAULT_BASE_B = int(os.environ.get("TABULA_BASE_B", "5000000"))
+_DEV_MODE = (
+    os.environ.get("TABULA_ORACLE_MOCK") == "1"
+    or os.environ.get("TABULA_ORACLE_DEV") == "1"
+)
+
+# ----------------------------------------------------------------------
 # Metrics
 # ----------------------------------------------------------------------
 PRED_COUNTER = Counter(
@@ -76,7 +89,7 @@ BACKEND_GAUGE = Gauge(
 # ----------------------------------------------------------------------
 class LiveState(BaseModel):
     minute: int = Field(..., ge=0, le=180)
-    score_diff: int
+    score_diff: int = Field(..., ge=-20, le=20)
     shots_on_target: int = Field(..., ge=0)
     possession: float = Field(..., ge=0.0, le=100.0)
     corners_so_far: int = Field(..., ge=0)
@@ -92,7 +105,8 @@ class PredictRequest(BaseModel):
     bin_edges: List[int]
     history: List[HistoryRow]
     live: LiveState
-    base_b: int = Field(5_000_000, ge=1, le=10_000_000_000)
+    # Client-supplied base_b is ignored; server uses TABULA_BASE_B / default.
+    base_b: Optional[int] = Field(None, ge=1, le=50_000_000)
 
 
 class PredictResponse(BaseModel):
@@ -107,12 +121,29 @@ class PredictResponse(BaseModel):
 
 
 # ----------------------------------------------------------------------
+# Auth
+# ----------------------------------------------------------------------
+def require_api_key(authorization: Optional[str] = Header(None)) -> None:
+    """If TABULA_ORACLE_API_KEY is set, require Authorization: Bearer <key>."""
+    if not API_KEY:
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    token = authorization[len("Bearer "):].strip()
+    if token != API_KEY:
+        raise HTTPException(status_code=403, detail="invalid api key")
+
+
+# ----------------------------------------------------------------------
 # App + engine
 # ----------------------------------------------------------------------
 app = FastAPI(
     title="Tabula Oracle",
     version="0.2.0",
     description="TabFM zero-shot probability oracle for TabulaMarkets",
+    docs_url="/docs" if _DEV_MODE else None,
+    redoc_url="/redoc" if _DEV_MODE else None,
+    openapi_url="/openapi.json" if _DEV_MODE else None,
 )
 
 _engine: Optional[TabFMEngine] = None
@@ -123,13 +154,16 @@ def get_engine() -> TabFMEngine:
     if _engine is None:
         n = int(os.environ.get("TABULA_ENSEMBLE_SIZE", "32"))
         _engine = TabFMEngine(ensemble_size=n)
-        BACKEND_GAUGE.labels(backend=_engine.backend).set(1)
+        up = 0 if _engine.backend == "unloaded" else 1
+        BACKEND_GAUGE.labels(backend=_engine.backend).set(up)
     return _engine
 
 
 @app.on_event("startup")
 def _warm() -> None:
-    get_engine()
+    eng = get_engine()
+    if eng.backend == "unloaded":
+        log.error("Oracle started with unloaded backend — /predict and /readyz will 503")
 
 
 # ----------------------------------------------------------------------
@@ -137,8 +171,8 @@ def _warm() -> None:
 # ----------------------------------------------------------------------
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    eng = get_engine()
-    return {"ok": True, "backend": eng.backend, "device": eng.device}
+    """Minimal public health — no backend details."""
+    return {"ok": True}
 
 
 @app.get("/healthz")
@@ -149,17 +183,25 @@ def healthz() -> Dict[str, Any]:
 @app.get("/readyz")
 def readyz() -> Dict[str, Any]:
     eng = get_engine()
-    return {"ready": eng.backend != "unloaded", "backend": eng.backend}
+    ready = eng.backend != "unloaded"
+    if not ready:
+        raise HTTPException(
+            status_code=503,
+            detail={"ready": False, "backend": eng.backend},
+        )
+    return {"ready": True, "backend": eng.backend}
 
 
-@app.get("/metrics")
+@app.get("/metrics", dependencies=[Depends(require_api_key)])
 def metrics() -> Response:
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.get("/model")
+@app.get("/model", dependencies=[Depends(require_api_key)])
 def model_info() -> Dict[str, Any]:
     eng = get_engine()
+    if eng.backend == "unloaded":
+        raise HTTPException(status_code=503, detail="backend unloaded")
     return {
         "backend":        eng.backend,
         "device":         eng.device,
@@ -169,9 +211,13 @@ def model_info() -> Dict[str, Any]:
     }
 
 
-@app.post("/predict", response_model=PredictResponse)
+@app.post("/predict", response_model=PredictResponse, dependencies=[Depends(require_api_key)])
 def predict(req: PredictRequest) -> PredictResponse:
     eng = get_engine()
+    if eng.backend == "unloaded":
+        PRED_COUNTER.labels(backend="unloaded", status="unavailable").inc()
+        raise HTTPException(status_code=503, detail="backend unloaded")
+
     t0 = time.perf_counter()
 
     try:
@@ -205,7 +251,8 @@ def predict(req: PredictRequest) -> PredictResponse:
         )
 
         q6 = probs_to_q6(result.probs)
-        b = dynamic_b(req.base_b, result.ensemble_divergence)
+        # Ignore client base_b; use server-controlled default.
+        b = dynamic_b(DEFAULT_BASE_B, result.ensemble_divergence)
 
         PRED_COUNTER.labels(backend=result.backend, status="ok").inc()
         PRED_LATENCY.labels(backend=result.backend).observe(result.latency_ms)
@@ -228,7 +275,7 @@ def predict(req: PredictRequest) -> PredictResponse:
         PRED_COUNTER.labels(backend=eng.backend, status="server_error").inc()
         raise HTTPException(status_code=500, detail=f"internal: {type(e).__name__}")
     finally:
-        _ = time.perf_counter() - t0  # (already captured in engine result)
+        _ = time.perf_counter() - t0
 
 
 # ----------------------------------------------------------------------
@@ -237,7 +284,7 @@ def predict(req: PredictRequest) -> PredictResponse:
 def _run_uvicorn() -> None:
     import uvicorn
 
-    host = os.environ.get("HOST", "0.0.0.0")
+    host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "8787"))
     workers = int(os.environ.get("UVICORN_WORKERS", "1"))
     uvicorn.run(

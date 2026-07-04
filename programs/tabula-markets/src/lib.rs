@@ -16,9 +16,16 @@
 //!     (a) receipt is signed by the configured `settlement_oracle` key,
 //!     (b) receipt.match_id matches the market,
 //!     (c) receipt.stat_type matches the market,
-//!     (d) the receipt is fresh (< MAX_RECEIPT_AGE_SEC old).
+//!     (d) the receipt is fresh (< MAX_RECEIPT_AGE_SEC old),
+//!     (e) attestation is one-shot and bound to (pool, market).
 //!
 //! Fixed-point convention: probabilities and `q`/`b` in Q_SCALE = 1_000_000.
+//!
+//! Trust notes (see SECURITY.md):
+//! - `real-txline` still trusts the keeper (`settlement_oracle`) to have
+//!   validated TxLINE off-chain; there is no on-chain Merkle/TxODDS CPI yet.
+//! - Share pricing is fixed-odds at the oracle marginal price with MIN_PROB
+//!   and liability caps — not a full LMSR cost function.
 
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
@@ -30,15 +37,19 @@ use txline_mock::program::TxlineMock;
 #[cfg(feature = "mock-txline")]
 use txline_mock::{self, StatReceipt as MockStatReceipt};
 
-declare_id!("Fd6fiHspckMKwwSDPkJHmnp69sQewApDVd7kQc4zUboR");
+declare_id!("GZ6F2Q5DWQopyxcyTQk7Jko58Fc9jPdEdGdfiSZS7Z9T");
 
 pub const Q_SCALE: u64        = 1_000_000;
 pub const MAX_OUTCOMES: usize = 10;
 pub const FEE_BPS: u16        = 200;      // 2% spread routed to LP treasury
 pub const SETTLE_FEE_BPS: u16 = 50;       // 0.5% off net winnings on payout
 
-/// Per-market USDC exposure ceiling (in raw USDC base units, 6 decimals).
-/// Prevents a runaway market from draining the shared LP vault.
+/// Minimum non-zero per-outcome probability (0.1% of Q_SCALE).
+/// Caps max shares-per-USDC at ~Q_SCALE/MIN_PROB (~1000×) before fees.
+pub const MIN_PROB: u64 = 1_000;
+
+/// Per-market max payout liability ceiling (raw USDC base units, 6 decimals).
+/// Tracks outstanding shares (claim pays $1/share), not stake-in.
 pub const MAX_MARKET_EXPOSURE: u64 = 1_000_000_000_000; // 1M USDC
 
 /// Reject settlement receipts older than this. Guards against replay of
@@ -50,6 +61,19 @@ pub mod tabula_markets {
     use super::*;
 
     // ---------------------------------------------------------------
+    // Global config (gates pool creation)
+    // ---------------------------------------------------------------
+
+    /// One-shot: first deployer becomes admin. Subsequent calls fail (init).
+    pub fn initialize_global(ctx: Context<InitializeGlobal>) -> Result<()> {
+        let g = &mut ctx.accounts.global_config;
+        g.admin = ctx.accounts.admin.key();
+        g.bump  = ctx.bumps.global_config;
+        emit!(GlobalInitialized { admin: g.admin });
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
     // Pool lifecycle
     // ---------------------------------------------------------------
 
@@ -58,8 +82,14 @@ pub mod tabula_markets {
         oracle_authority: Pubkey,
         settlement_oracle: Pubkey,
     ) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.admin.key(),
+            ctx.accounts.global_config.admin,
+            TabulaError::AdminUnauthorized
+        );
+
         let pool = &mut ctx.accounts.pool;
-        pool.authority         = ctx.accounts.authority.key();
+        pool.authority         = ctx.accounts.admin.key();
         pool.oracle_authority  = oracle_authority;
         pool.settlement_oracle = settlement_oracle;
         pool.usdc_mint         = ctx.accounts.usdc_mint.key();
@@ -136,6 +166,14 @@ pub mod tabula_markets {
         liquidity_b: u64,
     ) -> Result<()> {
         require!(!ctx.accounts.pool.paused, TabulaError::PoolPaused);
+
+        let creator = ctx.accounts.creator.key();
+        require!(
+            creator == ctx.accounts.pool.authority
+                || creator == ctx.accounts.pool.oracle_authority,
+            TabulaError::CreateMarketUnauthorized
+        );
+
         require!(
             (outcome_count as usize) <= MAX_OUTCOMES && outcome_count >= 2,
             TabulaError::OutcomeCountOutOfRange
@@ -150,21 +188,14 @@ pub mod tabula_markets {
         );
         require!(liquidity_b > 0, TabulaError::ZeroLiquidityParam);
 
-        // Enforce monotone bin edges (protects settlement bin-search logic).
         for w in bin_edges.windows(2) {
             require!(w[0] < w[1], TabulaError::BinEdgesNotMonotonic);
         }
 
-        let sum: u64 = initial_probs
-            .iter()
-            .try_fold(0u64, |acc, p| acc.checked_add(*p))
-            .ok_or(error!(TabulaError::ArithmeticOverflow))?;
-        require!(
-            sum.abs_diff(Q_SCALE) <= (outcome_count as u64),
-            TabulaError::ProbabilitiesNotNormalized
-        );
+        validate_probs(&initial_probs, outcome_count)?;
 
         let market = &mut ctx.accounts.market;
+        market.pool            = ctx.accounts.pool.key();
         market.match_id        = match_id;
         market.stat_type       = stat_type;
         market.outcome_count   = outcome_count;
@@ -174,7 +205,7 @@ pub mod tabula_markets {
         market.liquidity_b     = liquidity_b;
         market.status          = MarketStatus::Trading as u8;
         market.winning_outcome = u8::MAX;
-        market.creator         = ctx.accounts.creator.key();
+        market.creator         = creator;
         market.exposure        = 0;
         market.bump            = ctx.bumps.market;
 
@@ -205,14 +236,7 @@ pub mod tabula_markets {
         );
         require!(new_b > 0, TabulaError::ZeroLiquidityParam);
 
-        let sum: u64 = new_probs
-            .iter()
-            .try_fold(0u64, |acc, p| acc.checked_add(*p))
-            .ok_or(error!(TabulaError::ArithmeticOverflow))?;
-        require!(
-            sum.abs_diff(Q_SCALE) <= (market.outcome_count as u64),
-            TabulaError::ProbabilitiesNotNormalized
-        );
+        validate_probs(&new_probs, market.outcome_count)?;
 
         for (i, p) in new_probs.iter().enumerate() { market.probs[i] = *p; }
         market.liquidity_b = new_b;
@@ -243,16 +267,8 @@ pub mod tabula_markets {
             TabulaError::OutcomeOutOfRange
         );
 
-        // ---- LP exposure cap ---------------------------------------
-        let new_exposure = market
-            .exposure
-            .checked_add(usdc_amount)
-            .ok_or(error!(TabulaError::ArithmeticOverflow))?;
-        require!(new_exposure <= MAX_MARKET_EXPOSURE, TabulaError::ExposureCapExceeded);
-        market.exposure = new_exposure;
-
         let p_i = market.probs[outcome_idx as usize];
-        require!(p_i > 0, TabulaError::OutcomeZeroProb);
+        require!(p_i >= MIN_PROB, TabulaError::OutcomeZeroProb);
 
         // marginal price = p_i * (1 + fee_bps/10_000), all in Q_SCALE.
         let numer = (p_i as u128)
@@ -263,7 +279,7 @@ pub mod tabula_markets {
             .ok_or(error!(TabulaError::ArithmeticOverflow))? as u64;
         require!(price_scaled > 0, TabulaError::ShareCalcUnderflow);
 
-        // shares = usdc / price  (price in Q_SCALE)
+        // shares = usdc / price  (price in Q_SCALE); claim pays shares as USDC.
         let shares_u128 = (usdc_amount as u128)
             .checked_mul(Q_SCALE as u128)
             .ok_or(error!(TabulaError::ArithmeticOverflow))?
@@ -273,9 +289,22 @@ pub mod tabula_markets {
             .map_err(|_| error!(TabulaError::ArithmeticOverflow))?;
         require!(shares > 0, TabulaError::ShareCalcUnderflow);
 
-        // Transfer USDC bettor -> vault (effect BEFORE state mutation would be
-        // ideal, but Solana runtime is single-threaded and there is no
-        // reentrancy risk on token::transfer — the token program is trusted).
+        // Liability = outstanding shares on this outcome (max payout if it wins).
+        let idx = outcome_idx as usize;
+        let prior = market.q[idx].max(0) as u64;
+        let outcome_liability = prior
+            .checked_add(shares)
+            .ok_or(error!(TabulaError::ArithmeticOverflow))?;
+        require!(
+            outcome_liability <= MAX_MARKET_EXPOSURE,
+            TabulaError::ExposureCapExceeded
+        );
+        // Vault must cover the new max payout on this outcome.
+        require!(
+            outcome_liability <= ctx.accounts.vault.amount.saturating_add(usdc_amount),
+            TabulaError::InsufficientVaultLiquidity
+        );
+
         let cpi = CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
@@ -286,7 +315,6 @@ pub mod tabula_markets {
         );
         token::transfer(cpi, usdc_amount)?;
 
-        // Book position
         let position = &mut ctx.accounts.position;
         if position.owner == Pubkey::default() {
             position.owner        = ctx.accounts.bettor.key();
@@ -307,9 +335,10 @@ pub mod tabula_markets {
             .ok_or(error!(TabulaError::ArithmeticOverflow))?;
         position.claimed = false;
 
-        market.q[outcome_idx as usize] = market.q[outcome_idx as usize]
+        market.q[idx] = market.q[idx]
             .checked_add(shares as i64)
             .ok_or(error!(TabulaError::ArithmeticOverflow))?;
+        market.exposure = max_outcome_liability(market);
 
         let pool = &mut ctx.accounts.pool;
         let fee = usdc_amount
@@ -342,6 +371,11 @@ pub mod tabula_markets {
         proof: Vec<[u8; 32]>,
     ) -> Result<()> {
         require!(!ctx.accounts.pool.paused, TabulaError::PoolPaused);
+        require_keys_eq!(
+            ctx.accounts.settlement_oracle.key(),
+            ctx.accounts.pool.settlement_oracle,
+            TabulaError::OracleUnauthorized
+        );
 
         let market = &mut ctx.accounts.market;
         require!(market.status == MarketStatus::Trading as u8, TabulaError::AlreadySettled);
@@ -368,10 +402,12 @@ pub mod tabula_markets {
     }
 
     // ---------------------------------------------------------------
-    // Settlement — real backend
+    // Settlement — real / keeper-attested backend.
+    // Distinct ix name from mock `settle_via_txline` (Anchor #[program]
+    // cannot emit two variants of the same name with different signatures).
+    // Residual risk (F-004): trusts settlement_oracle; no on-chain TxODDS CPI.
     // ---------------------------------------------------------------
-    #[cfg(feature = "real-txline")]
-    pub fn settle_via_txline(
+    pub fn settle_via_tx_line_real(
         ctx: Context<SettleViaTxLineReal>,
         stat_value: u64,
         _txodds_fixture_id: u64,
@@ -382,6 +418,8 @@ pub mod tabula_markets {
 
         // Signer must be the pool's settlement oracle (keeper) which has
         // executed `validateStat.view()` against the real TxODDS program.
+        // Residual risk (F-004): a malicious/compromised keeper can still
+        // post a false attestation — there is no on-chain TxODDS CPI yet.
         require_keys_eq!(
             ctx.accounts.settlement_oracle.key(),
             ctx.accounts.pool.settlement_oracle,
@@ -391,20 +429,22 @@ pub mod tabula_markets {
         let market = &mut ctx.accounts.market;
         require!(market.status == MarketStatus::Trading as u8, TabulaError::AlreadySettled);
 
-        // Freshness check: settlement must happen close to when the keeper
-        // observed the on-chain Merkle validation.
+        let att = &mut ctx.accounts.attestation;
+        require!(!att.used, TabulaError::AttestationAlreadyUsed);
+
         let now = Clock::get()?.unix_timestamp;
-        let age = now.checked_sub(ctx.accounts.attestation.attested_at).unwrap_or(i64::MAX);
+        let age = now.checked_sub(att.attested_at).unwrap_or(i64::MAX);
         require!(age >= 0 && age <= MAX_RECEIPT_AGE_SEC, TabulaError::AttestationExpired);
-        require!(ctx.accounts.attestation.match_id == market.match_id, TabulaError::MatchIdMismatch);
-        require!(ctx.accounts.attestation.stat_type == market.stat_type, TabulaError::StatTypeMismatch);
-        require!(ctx.accounts.attestation.stat_value == stat_value, TabulaError::StatValueMismatch);
+        require!(att.match_id == market.match_id, TabulaError::MatchIdMismatch);
+        require!(att.stat_type == market.stat_type, TabulaError::StatTypeMismatch);
+        require!(att.stat_value == stat_value, TabulaError::StatValueMismatch);
         require_keys_eq!(
-            ctx.accounts.attestation.settlement_oracle,
+            att.settlement_oracle,
             ctx.accounts.pool.settlement_oracle,
             TabulaError::OracleUnauthorized
         );
 
+        att.used = true;
         resolve_market(market, stat_value)
     }
 
@@ -414,11 +454,12 @@ pub mod tabula_markets {
 
     pub fn claim_winnings(ctx: Context<ClaimWinnings>) -> Result<()> {
         require!(!ctx.accounts.pool.paused, TabulaError::PoolPaused);
-        let market   = &ctx.accounts.market;
         let position = &mut ctx.accounts.position;
-        require!(market.status == MarketStatus::Resolved as u8, TabulaError::NotResolved);
         require!(!position.claimed, TabulaError::AlreadyClaimed);
         require_keys_eq!(position.owner, ctx.accounts.bettor.key(), TabulaError::PositionOwnerMismatch);
+
+        let market = &mut ctx.accounts.market;
+        require!(market.status == MarketStatus::Resolved as u8, TabulaError::NotResolved);
 
         let payout = if position.outcome_idx == market.winning_outcome {
             let gross = position.shares;
@@ -432,12 +473,20 @@ pub mod tabula_markets {
             0
         };
 
-        // Mark BEFORE transfer to eliminate any theoretical reentrancy on
-        // token_program (defense in depth — the SPL token program is trusted
-        // but the pattern is worth keeping).
+        // Debit liability before transfer.
+        let idx = position.outcome_idx as usize;
+        if idx < market.outcome_count as usize && position.shares > 0 {
+            market.q[idx] = market.q[idx].saturating_sub(position.shares as i64);
+            market.exposure = max_outcome_liability(market);
+        }
+
         position.claimed = true;
 
         if payout > 0 {
+            require!(
+                ctx.accounts.vault.amount >= payout,
+                TabulaError::InsufficientVaultLiquidity
+            );
             let pool_key = ctx.accounts.pool.key();
             let seeds: &[&[u8]] = &[b"vault-auth", pool_key.as_ref(), &[ctx.bumps.vault_authority]];
             let signer = &[seeds];
@@ -461,11 +510,9 @@ pub mod tabula_markets {
     }
 
     // ---------------------------------------------------------------
-    // Real-txline: keeper posts a signed attestation account describing the
-    // outcome of a successful `validateStat` on the TxODDS program.
+    // Keeper posts a one-shot attestation bound to (pool, market).
     // ---------------------------------------------------------------
-    #[cfg(feature = "real-txline")]
-    pub fn post_txline_attestation(
+    pub fn post_tx_line_attestation(
         ctx: Context<PostTxLineAttestation>,
         match_id: [u8; 32],
         stat_type: [u8; 16],
@@ -479,6 +526,13 @@ pub mod tabula_markets {
             ctx.accounts.pool.settlement_oracle,
             TabulaError::OracleUnauthorized
         );
+        require!(
+            ctx.accounts.market.status == MarketStatus::Trading as u8,
+            TabulaError::NotTrading
+        );
+        require!(ctx.accounts.market.match_id == match_id, TabulaError::MatchIdMismatch);
+        require!(ctx.accounts.market.stat_type == stat_type, TabulaError::StatTypeMismatch);
+
         let att = &mut ctx.accounts.attestation;
         att.match_id           = match_id;
         att.stat_type          = stat_type;
@@ -488,6 +542,7 @@ pub mod tabula_markets {
         att.txodds_stat_key    = txodds_stat_key;
         att.settlement_oracle  = ctx.accounts.settlement_oracle.key();
         att.attested_at        = Clock::get()?.unix_timestamp;
+        att.used               = false;
         att.bump               = ctx.bumps.attestation;
         emit!(AttestationPosted { match_id, stat_value });
         Ok(())
@@ -495,8 +550,42 @@ pub mod tabula_markets {
 }
 
 // ------------------------------------------------------------------
-// Shared settlement logic
+// Shared helpers
 // ------------------------------------------------------------------
+
+/// Non-zero probs must be >= MIN_PROB; sum must be ≈ Q_SCALE.
+fn validate_probs(probs: &[u64], outcome_count: u8) -> Result<()> {
+    require!(
+        probs.len() == outcome_count as usize,
+        TabulaError::ProbCountMismatch
+    );
+    let sum: u64 = probs
+        .iter()
+        .try_fold(0u64, |acc, p| acc.checked_add(*p))
+        .ok_or(error!(TabulaError::ArithmeticOverflow))?;
+    require!(
+        sum.abs_diff(Q_SCALE) <= (outcome_count as u64),
+        TabulaError::ProbabilitiesNotNormalized
+    );
+    for p in probs {
+        require!(*p == 0 || *p >= MIN_PROB, TabulaError::ProbBelowMinimum);
+    }
+    // At least one tradable outcome.
+    require!(probs.iter().any(|p| *p >= MIN_PROB), TabulaError::ProbBelowMinimum);
+    Ok(())
+}
+
+fn max_outcome_liability(market: &Market) -> u64 {
+    let mut m = 0u64;
+    for i in 0..market.outcome_count as usize {
+        let s = market.q[i].max(0) as u64;
+        if s > m {
+            m = s;
+        }
+    }
+    m
+}
+
 fn resolve_market(market: &mut Account<Market>, stat_value: u64) -> Result<()> {
     let mut winning: Option<u8> = None;
     for i in 0..market.outcome_count as usize {
@@ -524,12 +613,35 @@ fn resolve_market(market: &mut Account<Market>, stat_value: u64) -> Result<()> {
 // ---------------------------------------------------------------
 
 #[derive(Accounts)]
-pub struct InitializePool<'info> {
+pub struct InitializeGlobal<'info> {
     #[account(mut)]
-    pub authority: Signer<'info>,
+    pub admin: Signer<'info>,
 
     #[account(
-        init, payer = authority,
+        init,
+        payer = admin,
+        space = 8 + GlobalConfig::MAX_SIZE,
+        seeds = [b"global"],
+        bump,
+    )]
+    pub global_config: Account<'info, GlobalConfig>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitializePool<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        seeds = [b"global"],
+        bump = global_config.bump,
+    )]
+    pub global_config: Account<'info, GlobalConfig>,
+
+    #[account(
+        init, payer = admin,
         space = 8 + Pool::MAX_SIZE,
         seeds = [b"pool", usdc_mint.key().as_ref()],
         bump,
@@ -539,7 +651,7 @@ pub struct InitializePool<'info> {
     pub usdc_mint: Account<'info, Mint>,
 
     #[account(
-        init, payer = authority,
+        init, payer = admin,
         seeds = [b"vault", pool.key().as_ref()],
         bump,
         token::mint      = usdc_mint,
@@ -596,7 +708,7 @@ pub struct CreateMarket<'info> {
     #[account(
         init, payer = creator,
         space = 8 + Market::MAX_SIZE,
-        seeds = [b"market", match_id.as_ref()],
+        seeds = [b"market", pool.key().as_ref(), match_id.as_ref()],
         bump,
     )]
     pub market: Account<'info, Market>,
@@ -612,8 +724,9 @@ pub struct UpdatePrediction<'info> {
     pub pool: Account<'info, Pool>,
 
     #[account(mut,
-        seeds = [b"market", market.match_id.as_ref()],
-        bump  = market.bump)]
+        seeds = [b"market", pool.key().as_ref(), market.match_id.as_ref()],
+        bump  = market.bump,
+        constraint = market.pool == pool.key() @ TabulaError::MarketPoolMismatch)]
     pub market: Account<'info, Market>,
 }
 
@@ -626,7 +739,10 @@ pub struct PlaceBet<'info> {
     #[account(mut, seeds = [b"pool", pool.usdc_mint.as_ref()], bump = pool.bump)]
     pub pool: Account<'info, Pool>,
 
-    #[account(mut, seeds = [b"market", market.match_id.as_ref()], bump = market.bump)]
+    #[account(mut,
+        seeds = [b"market", pool.key().as_ref(), market.match_id.as_ref()],
+        bump  = market.bump,
+        constraint = market.pool == pool.key() @ TabulaError::MarketPoolMismatch)]
     pub market: Account<'info, Market>,
 
     #[account(
@@ -656,10 +772,15 @@ pub struct SettleViaTxLineMock<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
 
+    pub settlement_oracle: Signer<'info>,
+
     #[account(seeds = [b"pool", pool.usdc_mint.as_ref()], bump = pool.bump)]
     pub pool: Account<'info, Pool>,
 
-    #[account(mut, seeds = [b"market", market.match_id.as_ref()], bump = market.bump)]
+    #[account(mut,
+        seeds = [b"market", pool.key().as_ref(), market.match_id.as_ref()],
+        bump  = market.bump,
+        constraint = market.pool == pool.key() @ TabulaError::MarketPoolMismatch)]
     pub market: Account<'info, Market>,
 
     /// CHECK: verified by TxLINE CPI
@@ -674,7 +795,6 @@ pub struct SettleViaTxLineMock<'info> {
     pub system_program: Program<'info, System>,
 }
 
-#[cfg(feature = "real-txline")]
 #[derive(Accounts)]
 pub struct SettleViaTxLineReal<'info> {
     #[account(mut)]
@@ -685,16 +805,19 @@ pub struct SettleViaTxLineReal<'info> {
     #[account(seeds = [b"pool", pool.usdc_mint.as_ref()], bump = pool.bump)]
     pub pool: Account<'info, Pool>,
 
-    #[account(mut, seeds = [b"market", market.match_id.as_ref()], bump = market.bump)]
+    #[account(mut,
+        seeds = [b"market", pool.key().as_ref(), market.match_id.as_ref()],
+        bump  = market.bump,
+        constraint = market.pool == pool.key() @ TabulaError::MarketPoolMismatch)]
     pub market: Account<'info, Market>,
 
-    #[account(
-        seeds = [b"attestation", market.key().as_ref()],
-        bump = attestation.bump)]
+    #[account(mut,
+        seeds = [b"attestation", pool.key().as_ref(), market.key().as_ref()],
+        bump = attestation.bump,
+        constraint = !attestation.used @ TabulaError::AttestationAlreadyUsed)]
     pub attestation: Account<'info, TxLineAttestation>,
 }
 
-#[cfg(feature = "real-txline")]
 #[derive(Accounts)]
 #[instruction(match_id: [u8; 32])]
 pub struct PostTxLineAttestation<'info> {
@@ -706,14 +829,18 @@ pub struct PostTxLineAttestation<'info> {
     #[account(seeds = [b"pool", pool.usdc_mint.as_ref()], bump = pool.bump)]
     pub pool: Account<'info, Pool>,
 
-    #[account(seeds = [b"market", match_id.as_ref()], bump)]
+    #[account(
+        seeds = [b"market", pool.key().as_ref(), match_id.as_ref()],
+        bump = market.bump,
+        constraint = market.pool == pool.key() @ TabulaError::MarketPoolMismatch)]
     pub market: Account<'info, Market>,
 
+    // One-shot: `init` (not init_if_needed) so attestation cannot be rewritten.
     #[account(
-        init_if_needed,
+        init,
         payer = payer,
         space = 8 + TxLineAttestation::MAX_SIZE,
-        seeds = [b"attestation", market.key().as_ref()],
+        seeds = [b"attestation", pool.key().as_ref(), market.key().as_ref()],
         bump,
     )]
     pub attestation: Account<'info, TxLineAttestation>,
@@ -729,7 +856,10 @@ pub struct ClaimWinnings<'info> {
     #[account(seeds = [b"pool", pool.usdc_mint.as_ref()], bump = pool.bump)]
     pub pool: Account<'info, Pool>,
 
-    #[account(seeds = [b"market", market.match_id.as_ref()], bump = market.bump)]
+    #[account(mut,
+        seeds = [b"market", pool.key().as_ref(), market.match_id.as_ref()],
+        bump  = market.bump,
+        constraint = market.pool == pool.key() @ TabulaError::MarketPoolMismatch)]
     pub market: Account<'info, Market>,
 
     #[account(mut,
@@ -758,10 +888,19 @@ pub struct ClaimWinnings<'info> {
 // ---------------------------------------------------------------
 
 #[account]
+pub struct GlobalConfig {
+    pub admin: Pubkey,
+    pub bump:  u8,
+}
+impl GlobalConfig {
+    pub const MAX_SIZE: usize = 32 + 1;
+}
+
+#[account]
 pub struct Pool {
     pub authority:         Pubkey,
     pub oracle_authority:  Pubkey,   // signs update_prediction
-    pub settlement_oracle: Pubkey,   // signs settle / post_txline_attestation
+    pub settlement_oracle: Pubkey,   // signs settle / post_tx_line_attestation
     pub usdc_mint:         Pubkey,
     pub vault:             Pubkey,
     pub total_liquidity:   u64,
@@ -774,6 +913,7 @@ impl Pool { pub const MAX_SIZE: usize = 32*5 + 8*2 + 1*3; }
 
 #[account]
 pub struct Market {
+    pub pool:             Pubkey,
     pub match_id:         [u8; 32],
     pub stat_type:        [u8; 16],
     pub outcome_count:    u8,
@@ -784,12 +924,14 @@ pub struct Market {
     pub status:           u8,
     pub winning_outcome:  u8,
     pub creator:          Pubkey,
+    /// Max outstanding payout liability (shares) across outcomes.
     pub exposure:         u64,
     pub bump:             u8,
 }
 impl Market {
     pub const MAX_SIZE: usize =
-        32 + 16 + 1
+        32 // pool
+        + 32 + 16 + 1
         + 8 * (MAX_OUTCOMES + 1)
         + 8 * MAX_OUTCOMES
         + 8 * MAX_OUTCOMES
@@ -818,10 +960,11 @@ pub struct TxLineAttestation {
     pub txodds_stat_key:    u16,
     pub settlement_oracle:  Pubkey,
     pub attested_at:        i64,
+    pub used:               bool,
     pub bump:               u8,
 }
 impl TxLineAttestation {
-    pub const MAX_SIZE: usize = 32 + 16 + 8 + 8 + 4 + 2 + 32 + 8 + 1;
+    pub const MAX_SIZE: usize = 32 + 16 + 8 + 8 + 4 + 2 + 32 + 8 + 1 + 1;
 }
 
 #[repr(u8)]
@@ -831,6 +974,7 @@ pub enum MarketStatus { Trading = 0, Resolved = 1, Cancelled = 2 }
 // Events & Errors
 // ---------------------------------------------------------------
 
+#[event] pub struct GlobalInitialized { pub admin: Pubkey }
 #[event] pub struct MarketCreated     { pub match_id: [u8;32], pub stat_type: [u8;16], pub outcome_count: u8 }
 #[event] pub struct PredictionUpdated { pub match_id: [u8;32], pub new_b: u64 }
 #[event] pub struct BetPlaced         { pub match_id: [u8;32], pub outcome_idx: u8, pub usdc_amount: u64, pub shares: u64, pub price_scaled: u64 }
@@ -848,9 +992,10 @@ pub enum TabulaError {
     #[msg("bin_edges must be strictly monotonic ascending")]  BinEdgesNotMonotonic,
     #[msg("probs length must equal outcome_count")]           ProbCountMismatch,
     #[msg("Probabilities must sum to Q_SCALE")]               ProbabilitiesNotNormalized,
+    #[msg("Non-zero probability below MIN_PROB")]             ProbBelowMinimum,
     #[msg("Liquidity parameter b must be > 0")]               ZeroLiquidityParam,
     #[msg("Outcome index out of range")]                      OutcomeOutOfRange,
-    #[msg("Outcome probability is zero")]                     OutcomeZeroProb,
+    #[msg("Outcome probability is zero or below MIN_PROB")]   OutcomeZeroProb,
     #[msg("Cannot switch outcomes on existing position")]     OutcomeMismatch,
     #[msg("Market is not in Trading state")]                  NotTrading,
     #[msg("Market already settled")]                          AlreadySettled,
@@ -865,8 +1010,12 @@ pub enum TabulaError {
     #[msg("Share calculation underflow")]                     ShareCalcUnderflow,
     #[msg("Only the market oracle may update predictions")]   OracleUnauthorized,
     #[msg("Only the pool authority may perform this action")] AdminUnauthorized,
-    #[msg("Per-market USDC exposure cap exceeded")]           ExposureCapExceeded,
+    #[msg("Only pool authority or oracle may create markets")] CreateMarketUnauthorized,
+    #[msg("Market is not bound to this pool")]                MarketPoolMismatch,
+    #[msg("Per-market payout liability cap exceeded")]        ExposureCapExceeded,
+    #[msg("Vault has insufficient liquidity for liability")]  InsufficientVaultLiquidity,
     #[msg("Arithmetic overflow")]                             ArithmeticOverflow,
     #[msg("Pool is paused")]                                  PoolPaused,
     #[msg("TxLINE attestation expired")]                      AttestationExpired,
+    #[msg("TxLINE attestation already consumed")]             AttestationAlreadyUsed,
 }

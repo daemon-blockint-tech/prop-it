@@ -3,13 +3,13 @@
  *
  * Run against a local validator:
  *   solana-test-validator --reset
- *   anchor build && anchor deploy
- *   anchor test --skip-local-validator
+ *   NO_DNA=1 anchor build && anchor deploy
+ *   NO_DNA=1 anchor test --skip-local-validator
  *
  * The full lifecycle is:
- *   initialize_pool → deposit_liquidity → create_market
+ *   initialize_global → initialize_pool → deposit_liquidity → create_market
  *     → update_prediction → place_bet
- *     → publish_stat_root (txline-mock) → settle_via_txline
+ *     → txline.initialize → publish_stat_root → settle_via_txline
  *     → claim_winnings
  */
 
@@ -20,7 +20,6 @@ import {
   createMint,
   createAssociatedTokenAccount,
   mintTo,
-  getAccount,
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import { keccak_256 } from "@noble/hashes/sha3";
@@ -60,16 +59,31 @@ describe("tabula-markets", () => {
   const oracleKey = authority;
   const keeperKey = authority;
   let usdcMint: PublicKey;
+  let globalPda: PublicKey;
   let poolPda: PublicKey;
   let vaultPda: PublicKey;
   let vaultAuth: PublicKey;
   let marketPda: PublicKey;
+  let txlineConfigPda: PublicKey;
   const matchId  = Buffer.alloc(32); matchId.write("wc-r16-arg-fra");
   const statType = utf8Bytes("corners_h2", 16);
+  // All probs >= MIN_PROB (1_000); sum = Q_SCALE.
   const binEdges = [new BN(0), new BN(3), new BN(6), new BN(9), new BN(999)];
   const initialProbs = [new BN(120_000), new BN(480_000), new BN(300_000), new BN(100_000)];
 
   it("initializes pool + market lifecycle", async () => {
+    // 0. Global config (admin gate for pool creation)
+    [globalPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("global")], tabula.programId);
+
+    await tabula.methods.initializeGlobal()
+      .accounts({
+        admin: authority.publicKey,
+        globalConfig: globalPda,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
     // 1. USDC-like mint
     usdcMint = await createMint(provider.connection, authority, authority.publicKey, null, 6);
 
@@ -80,10 +94,10 @@ describe("tabula-markets", () => {
     [vaultAuth] = PublicKey.findProgramAddressSync(
       [Buffer.from("vault-auth"), poolPda.toBuffer()], tabula.programId);
 
-    // v0.2 signature: initialize_pool(oracle_authority, settlement_oracle)
     await tabula.methods.initializePool(oracleKey.publicKey, keeperKey.publicKey)
       .accounts({
-        authority: authority.publicKey,
+        admin: authority.publicKey,
+        globalConfig: globalPda,
         pool: poolPda,
         usdcMint,
         vault: vaultPda,
@@ -106,9 +120,9 @@ describe("tabula-markets", () => {
         tokenProgram: TOKEN_PROGRAM_ID,
       }).rpc();
 
-    // 3. Create market
+    // 3. Create market (seeds include pool)
     [marketPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("market"), matchId], tabula.programId);
+      [Buffer.from("market"), poolPda.toBuffer(), matchId], tabula.programId);
     await tabula.methods.createMarket(
         Array.from(matchId), Array.from(statType), 4,
         binEdges, initialProbs, new BN(5_000_000))
@@ -121,9 +135,21 @@ describe("tabula-markets", () => {
     const mkt = await tabula.account.market.fetch(marketPda);
     expect(mkt.outcomeCount).to.equal(4);
     expect(mkt.probs[1].toNumber()).to.equal(480_000);
+    expect(mkt.pool.toBase58()).to.equal(poolPda.toBase58());
   });
 
   it("settles via TxLINE CPI", async () => {
+    // Initialize txline-mock config (authority-gated publish)
+    [txlineConfigPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("config")], txline.programId);
+
+    await txline.methods.initialize()
+      .accounts({
+        authority: authority.publicKey,
+        config: txlineConfigPda,
+        systemProgram: SystemProgram.programId,
+      }).rpc();
+
     // Build a 4-leaf Merkle tree over corners_h2 stats for the match.
     const leaves = [
       hashLeaf(statType, new BN(5)),
@@ -141,6 +167,7 @@ describe("tabula-markets", () => {
     await txline.methods.publishStatRoot(Array.from(matchId), Array.from(root))
       .accounts({
         authority: authority.publicKey,
+        config: txlineConfigPda,
         statRoot: statRootPda,
         systemProgram: SystemProgram.programId,
       }).rpc();
@@ -154,6 +181,8 @@ describe("tabula-markets", () => {
         Array.from(statType), new BN(5), proof)
       .accounts({
         payer: authority.publicKey,
+        settlementOracle: keeperKey.publicKey,
+        pool: poolPda,
         market: marketPda,
         statRoot: statRootPda,
         receipt: receiptPda,

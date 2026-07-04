@@ -41,7 +41,7 @@ async function main() {
 
   try {
     const h = await oracleHealth();
-    log.info({ backend: h.backend }, "oracle.health.ok");
+    log.info({ ok: h.ok }, "oracle.health.ok");
     setHealth("oracle", true);
   } catch (e) {
     log.warn({ err: String(e) }, "oracle.health.fail");
@@ -83,11 +83,11 @@ async function runRealFeed(history: any[]) {
     if (payload?.fixtureId !== TXODDS_FIXTURE_ID) continue;
 
     const live = {
-      minute:           payload.minute          ?? 0,
-      score_diff:       payload.scoreDiff       ?? 0,
-      shots_on_target:  payload.shotsOnTarget   ?? 0,
-      possession:       payload.possession      ?? 50,
-      corners_so_far:   payload.cornersSoFar    ?? 0,
+      minute:           Number(payload.minute          ?? 0),
+      score_diff:       Number(payload.scoreDiff       ?? 0),
+      shots_on_target:  Number(payload.shotsOnTarget   ?? 0),
+      possession:       Number(payload.possession      ?? 50),
+      corners_so_far:   Number(payload.cornersSoFar    ?? 0),
     };
 
     try {

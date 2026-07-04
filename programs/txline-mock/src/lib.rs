@@ -7,8 +7,10 @@
 //!
 //! Design mirrors the surface described in the TabulaMarkets architecture doc:
 //!
+//! * A one-shot `TxLineConfig` PDA that stores the sole authority allowed to
+//!   publish Merkle roots.
 //! * A `StatRoot` PDA that stores the Merkle root of a match's official stats,
-//!   signed by TxLINE authority when a match reaches full-time.
+//!   signed by that authority when a match reaches full-time.
 //! * A `validate_stat` instruction that verifies a Merkle proof against the
 //!   published root and — on success — writes the definitive stat value into
 //!   a scratch account so the caller (via CPI) can read it back.
@@ -16,19 +18,34 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::keccak;
 
-declare_id!("Cx7NL2thRV167d1PaMUgiARvTwLua34KQ7S5qkTBH4oE");
+declare_id!("9zs9jxdsjQigoKYpUuUYfBz5fdym3xXgdQa4twEjCYr");
 
 #[program]
 pub mod txline_mock {
     use super::*;
 
-    /// Called once by the (mocked) TxLINE authority right after a match reaches
-    /// full-time. Anchors the Merkle root of the official stats on-chain.
+    /// One-shot: first caller becomes the sole TxLINE authority.
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        config.authority = ctx.accounts.authority.key();
+        config.bump      = ctx.bumps.config;
+        emit!(ConfigInitialized { authority: config.authority });
+        Ok(())
+    }
+
+    /// Called once by the configured TxLINE authority right after a match
+    /// reaches full-time. Anchors the Merkle root of the official stats.
     pub fn publish_stat_root(
         ctx: Context<PublishStatRoot>,
         match_id: [u8; 32],
         merkle_root: [u8; 32],
     ) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.authority.key(),
+            ctx.accounts.config.authority,
+            TxLineError::Unauthorized
+        );
+
         let root = &mut ctx.accounts.stat_root;
         root.match_id     = match_id;
         root.merkle_root  = merkle_root;
@@ -98,15 +115,38 @@ pub mod txline_mock {
 // --------------------------------------------------------------------------
 
 #[derive(Accounts)]
-#[instruction(match_id: [u8; 32])]
-pub struct PublishStatRoot<'info> {
+pub struct Initialize<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
 
     #[account(
         init,
         payer = authority,
-        space = 8 + StatRoot::MAX_SIZE,
+        space = 8 + TxLineConfig::INIT_SPACE,
+        seeds = [b"config"],
+        bump,
+    )]
+    pub config: Account<'info, TxLineConfig>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(match_id: [u8; 32])]
+pub struct PublishStatRoot<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [b"config"],
+        bump = config.bump,
+    )]
+    pub config: Account<'info, TxLineConfig>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + StatRoot::INIT_SPACE,
         seeds = [b"stat-root", match_id.as_ref()],
         bump,
     )]
@@ -145,6 +185,15 @@ pub struct ValidateStat<'info> {
 // --------------------------------------------------------------------------
 
 #[account]
+pub struct TxLineConfig {
+    pub authority: Pubkey,
+    pub bump:      u8,
+}
+impl TxLineConfig {
+    pub const MAX_SIZE: usize = 32 + 1;
+}
+
+#[account]
 pub struct StatRoot {
     pub match_id:     [u8; 32],
     pub merkle_root:  [u8; 32],
@@ -173,6 +222,11 @@ impl StatReceipt {
 // --------------------------------------------------------------------------
 
 #[event]
+pub struct ConfigInitialized {
+    pub authority: Pubkey,
+}
+
+#[event]
 pub struct StatRootPublished {
     pub match_id:    [u8; 32],
     pub merkle_root: [u8; 32],
@@ -190,4 +244,6 @@ pub struct StatValidated {
 pub enum TxLineError {
     #[msg("Merkle proof does not reconstruct to the anchored root")]
     InvalidProof,
+    #[msg("Only the configured TxLINE authority may publish roots")]
+    Unauthorized,
 }

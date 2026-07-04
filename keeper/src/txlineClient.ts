@@ -80,7 +80,8 @@ export class TxLineClient {
       body:    JSON.stringify({ wallet_name: this.walletName }),
     });
     if (!res.ok) {
-      throw new Error(`TxLINE guest-start failed: ${res.status} ${await res.text()}`);
+      // Do not embed response bodies (may contain tokens).
+      throw new Error(`TxLINE guest-start failed: HTTP ${res.status}`);
     }
     const body = await res.json() as GuestSessionResponse;
     this.jwt       = body.jwt;
@@ -109,7 +110,7 @@ export class TxLineClient {
       body: JSON.stringify(params),
     });
     if (!res.ok) {
-      throw new Error(`TxLINE activate failed: ${res.status} ${await res.text()}`);
+      throw new Error(`TxLINE activate failed: HTTP ${res.status}`);
     }
     const { apiToken } = await res.json() as { apiToken: string };
     this.apiToken = apiToken;
@@ -150,7 +151,7 @@ export class TxLineClient {
     const url = `${this.apiBase}/scores/stat-validation?${q.toString()}`;
     const res = await fetch(url, { headers: this.authHeaders() });
     if (!res.ok) {
-      throw new Error(`stat-validation failed: ${res.status} ${await res.text()}`);
+      throw new Error(`stat-validation failed: HTTP ${res.status}`);
     }
     return await res.json() as StatValidationResponse;
   }

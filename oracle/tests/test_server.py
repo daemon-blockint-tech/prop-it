@@ -30,11 +30,21 @@ def test_health():
     r = client.get("/health")
     assert r.status_code == 200
     assert r.json()["ok"] is True
+    # Minimal public health — no backend details.
+    assert "backend" not in r.json()
 
 
 def test_readyz():
     r = client.get("/readyz")
     assert r.status_code == 200
+    assert r.json()["ready"] is True
+
+
+def test_predict_rejects_extreme_score_diff():
+    b = _valid_body()
+    b["live"]["score_diff"] = 99
+    r = client.post("/predict", json=b)
+    assert r.status_code == 422
 
 
 def test_metrics_prometheus_format():
