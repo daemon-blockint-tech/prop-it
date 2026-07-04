@@ -54,6 +54,11 @@ describe("tabula-markets", () => {
 
   const authority = (provider.wallet as anchor.Wallet).payer;
   const bettor    = Keypair.generate();
+  // Prediction oracle and settlement oracle. In production these are
+  // different keys held by the keeper bot; for the mock test we reuse
+  // `authority` as both to keep the fixture small.
+  const oracleKey = authority;
+  const keeperKey = authority;
   let usdcMint: PublicKey;
   let poolPda: PublicKey;
   let vaultPda: PublicKey;
@@ -75,7 +80,8 @@ describe("tabula-markets", () => {
     [vaultAuth] = PublicKey.findProgramAddressSync(
       [Buffer.from("vault-auth"), poolPda.toBuffer()], tabula.programId);
 
-    await tabula.methods.initializePool()
+    // v0.2 signature: initialize_pool(oracle_authority, settlement_oracle)
+    await tabula.methods.initializePool(oracleKey.publicKey, keeperKey.publicKey)
       .accounts({
         authority: authority.publicKey,
         pool: poolPda,

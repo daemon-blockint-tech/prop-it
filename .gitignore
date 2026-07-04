@@ -1,32 +1,62 @@
-# Rust / Anchor
+# --- Secrets — MUST STAY IGNORED ---------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id.json
+id_*.json
+keypair-*.json
+*.keypair.json
+solana-keypair.json
+.solana/
+.anchor/wallet.json
+.claude/
+.cursor/secrets/
+*.secret
+secrets/
+credentials/
+
+# --- Rust / Anchor -----------------------------------------------
 target/
 .anchor/
 test-ledger/
 **/*.rs.bk
 Cargo.lock
 
-# Node
+# --- Node --------------------------------------------------------
 node_modules/
 dist/
 .next/
 .turbo/
 *.log
-.env
-.env.local
-.env.*.local
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
 
-# Python
+# --- Python ------------------------------------------------------
 __pycache__/
 *.pyc
 .venv/
+venv/
 .pytest_cache/
 *.egg-info/
 build/
+htmlcov/
+.coverage
+.mypy_cache/
+.ruff_cache/
 
-# OS
+# --- Docker ------------------------------------------------------
+.docker/
+
+# --- OS ----------------------------------------------------------
 .DS_Store
 Thumbs.db
 
-# IDE
+# --- IDE ---------------------------------------------------------
 .vscode/
 .idea/
+*.swp

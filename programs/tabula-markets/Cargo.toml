@@ -1,6 +1,6 @@
 [package]
 name = "tabula-markets"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI-driven dynamic LMSR prop-bet AMM with cryptographic settlement on Solana"
 edition = "2021"
 
@@ -13,9 +13,19 @@ no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
-default = []
+
+# --- runtime toggles -----------------------------------------------------
+# `mock-txline` (default in dev) wires up the local txline-mock program so
+# the whole flow runs on a local validator with no external dependencies.
+# `real-txline` (production) skips the CPI Rust-crate dependency and instead
+# accepts a raw AccountInfo for the TxLINE `txoracle` program and validates
+# the receipt fields off-chain via signed `validateStat.view()` transactions
+# executed by the keeper before invoking `settle_via_txline`.
+mock-txline = ["dep:txline-mock"]
+real-txline = []
+default     = ["mock-txline"]
 
 [dependencies]
 anchor-lang = "0.30.1"
 anchor-spl  = "0.30.1"
-txline-mock = { path = "../txline-mock", features = ["cpi"] }
+txline-mock = { path = "../txline-mock", features = ["cpi"], optional = true }

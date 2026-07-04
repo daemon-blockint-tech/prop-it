@@ -1,104 +1,116 @@
-# TabulaMarkets · `prop-it`
+# TabulaMarkets
 
-**AI-driven dynamic-LMSR AMM for sports prop-bets with cryptographic settlement on Solana.**
-Submitted to the [TxODDS × Solana Prediction Markets & Settlement track](https://superteam.fun/earn/listing/prediction-markets-and-settlement/).
+AI-driven dynamic-LMSR prop-bet AMM on Solana. Prices are steered by an
+ensemble of Google Research's [TabFM](https://github.com/google-research/tabfm)
+tabular foundation model; settlement is cryptographically proven via
+[TxLINE](https://txline.txodds.com/) Merkle roots.
 
-TabulaMarkets removes both human market makers *and* optimistic-oracle
-dispute windows from long-tail sports prop markets. A Google Research
-[TabFM](https://github.com/google-research/tabfm) ensemble runs zero-shot
-in-context inference on historical + live TxLINE tabular data to price
-outcome bins in real time. An Anchor program on Solana consumes those
-predictions through a dynamic-LMSR curve and settles trustlessly via a
-Cross-Program Invocation into the TxLINE `validate_stat` program.
+**Status:** hackathon MVP + production-hardening pass. Not audited. Devnet only.
 
-> **Devnet only.** No real funds. Hackathon MVP.
+## Architecture (four layers)
 
----
-
-## Repository layout
-
-```
-prop-it/
-├── programs/
-│   ├── tabula-markets/    ← Anchor program: LMSR pool, markets, positions, CPI settle
-│   └── txline-mock/       ← Local stand-in for TxLINE on-chain validate_stat program
-├── oracle/                ← Python FastAPI service wrapping TabFM (v1.0.0 PyTorch)
-├── keeper/                ← TypeScript keeper bot: TxLINE feed → oracle → Solana
-├── app/                   ← Next.js frontend + Verifiable Resolution UI
-├── docs/                  ← Architecture, ADRs, PRD
-└── scripts/               ← Local devnet bootstrap helpers
-```
-
-## Architecture in one diagram
+1. **On-chain (Rust / Anchor 0.30)** — `programs/tabula-markets`
+   - Dynamic LMSR AMM (Q6 fixed-point), per-market exposure cap, admin
+     kill-switch, oracle-authority separation, arithmetic-overflow-safe.
+   - Two settlement backends via Cargo feature flags:
+     - `mock-txline` (default) — CPI into the bundled `programs/txline-mock`.
+     - `real-txline` — verifies keeper-signed `TxLineAttestation` accounts
+       backed by TxODDS `txoracle.validateStat` on devnet/mainnet.
+2. **Oracle (Python / FastAPI)** — `oracle/`
+   - Real TabFM (PyTorch backend, CPU/CUDA/MPS auto-detect) or mock.
+   - Structured JSON logs, Prometheus /metrics, /healthz + /readyz.
+3. **Keeper (TypeScript / Node)** — `keeper/`
+   - Real TxLINE REST + SSE client (`txlineClient.ts`) with JWT + API token flow.
+   - Local `LocalTxLineEmulator` for offline dev.
+   - Prometheus /metrics + /healthz + /readyz.
+4. **Frontend (Next.js)** — `app/`
+   - MarketPanel, OracleStatus, ReceiptPanel. Devnet wallet-adapter ready.
 
 ```
-┌────────────┐    ticks (8-10ms)    ┌─────────────┐   probs+b   ┌────────────────────────┐
-│  TxLINE    │────────────────────▶ │  Keeper Bot │────────────▶│  tabula-markets        │
-│  feed      │                      │  (TS/Node)  │             │  Anchor program        │
-└────────────┘                      └──────┬──────┘             │  · LMSR state          │
-      │                                    │ /predict           │  · Position PDAs       │
-      │                                    ▼                    │  · Vault (USDC)        │
-      │                             ┌─────────────┐             └──────────┬─────────────┘
-      │                             │  Oracle     │                        │ CPI: validate_stat
-      │                             │  FastAPI +  │                        ▼
-      │  publish_stat_root          │  TabFM v1.0 │             ┌────────────────────────┐
-      └────────────────────────────▶│  ensemble   │             │  txline-mock program   │
-                                    └─────────────┘             │  · StatRoot            │
-                                                                │  · StatReceipt (Merkle)│
-                                                                └────────────────────────┘
+       TxLINE feed  ─▶  keeper  ─▶  update_prediction  ─▶  tabula-markets
+                                         │
+                                         ▼
+       TabFM oracle  ◀─  callOracle()    place_bet / settle / claim  ─▶  Solana
 ```
 
-## Quickstart (fully offline)
+## Quick Start
+
+### Local demo (mock everything)
 
 ```bash
-# 1) Oracle
-cd oracle
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
-# real TabFM (recommended for the submission):
-pip install "tabfm[pytorch] @ git+https://github.com/google-research/tabfm.git"
-# or, quick mock for laptops without GPU:
-export TABULA_ORACLE_MOCK=1
-uvicorn tabula_oracle.server:app --port 8787
+git clone https://github.com/daemon-blockint-tech/prop-it
+cd prop-it
 
-# 2) Keeper (in another shell)
-cd keeper
-cp .env.example .env
-npm install
-npm run simulate      # emulates a full 90' match and drives the oracle
+# oracle (mock backend, no GPU needed)
+./scripts/install-oracle.sh --mock
+source oracle/.venv/bin/activate
+TABULA_ORACLE_MOCK=1 tabula-oracle &
 
-# 3) Frontend (in another shell)
-cd app
-npm install
-npm run dev           # http://localhost:3000
+# keeper (local emulator)
+cd keeper && npm install && npm run simulate
 ```
 
-## Deploying to Solana devnet
+### Reproducible Docker
 
 ```bash
-solana config set --url devnet
-anchor build
-anchor deploy
-# grab the deployed program IDs and copy them into keeper/.env and app/.env.local
+cp keeper/.env.example keeper/.env       # fill in the real values
+docker compose up --build
 ```
 
-The Anchor tests under `programs/tabula-markets/tests/` exercise the full
-lifecycle: `initialize_pool → deposit_liquidity → create_market →
-update_prediction → place_bet → publish_stat_root → settle_via_txline →
-claim_winnings`.
+Oracle → `http://localhost:8787`, keeper metrics → `http://localhost:9464/metrics`.
 
-## Judging cheat-sheet (Prediction Markets & Settlement track)
+## Devnet Deploy
 
-| Criterion                       | Where implemented                                                         |
-|---------------------------------|---------------------------------------------------------------------------|
-| Decentralized AMM               | [`programs/tabula-markets/src/lib.rs`](programs/tabula-markets/src/lib.rs) — LMSR with oracle-adjusted `b` |
-| Custom on-chain settlement      | `settle_via_txline` instruction — CPI into TxLINE program                 |
-| Verifiable data delivery        | `programs/txline-mock/src/lib.rs` — keccak Merkle proof over stats        |
-| TxLINE feed integration         | [`keeper/src/txlineFeed.ts`](keeper/src/txlineFeed.ts) + WS shim         |
-| AI-native pricing               | [`oracle/tabula_oracle/tabfm_engine.py`](oracle/tabula_oracle/tabfm_engine.py) — real TabFM v1.0.0 ensemble |
-| UX / Verifiable Resolution UI   | [`app/src/components/ReceiptPanel.tsx`](app/src/components/ReceiptPanel.tsx) |
+See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the full recipe. TL;DR:
 
-## Legal
+```bash
+anchor build                                # mock backend, for tests
+# or:
+cd programs/tabula-markets && \
+  anchor build -- --no-default-features --features real-txline
 
-Devnet only. No monetary value. Apache-2.0. This is not an officially
-supported Google product; TabFM is used under its own Apache-2.0 license.
+anchor deploy --provider.cluster devnet
+```
+
+The real TxLINE devnet program is
+`6pW64gN1s2uqjHkn1unFeEjAwJkPGHoppGvS715wyP2J` — already wired in
+`keeper/src/config.ts`.
+
+## Production Checklist
+
+- ✅ `checked_add`/`checked_mul`/`checked_div` on every path
+- ✅ Oracle-authority separation (`pool.oracle_authority`, `pool.settlement_oracle`)
+- ✅ Per-market USDC exposure cap
+- ✅ Pool-level pause / kill switch
+- ✅ Attestation freshness check (`MAX_RECEIPT_AGE_SEC = 15 min`)
+- ✅ Monotone-bins validation on `create_market`
+- ✅ Prometheus metrics + healthz probes on oracle + keeper
+- ✅ JSON structured logging with secret redaction
+- ✅ Docker + docker-compose for reproducible deploy
+- ✅ GitHub Actions: gitleaks, ruff, pytest, tsc, anchor build (mock + real)
+- ✅ Dependabot for npm / pip / cargo / actions
+- ✅ Pre-commit hooks: gitleaks, private-key detector, ruff
+- ⚠️ External audit — not started, required before any mainnet deploy
+- ⚠️ Emergency-cancel instruction — not yet implemented
+- ⚠️ TabFM ensemble load-testing at ensemble_size=32 — pending
+
+See [`SECURITY.md`](SECURITY.md) for the full threat model and
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md) for the on-call playbook.
+
+## Repository Layout
+
+```
+programs/tabula-markets/  # On-chain LMSR AMM (Anchor)
+programs/txline-mock/     # Bundled mock oracle for local dev
+oracle/                   # FastAPI + TabFM service
+keeper/                   # TxLINE ⇆ oracle ⇆ Solana bridge (Node)
+app/                      # Next.js frontend
+docs/                     # ARCHITECTURE, PRD, ADR, DEPLOYMENT, RUNBOOK
+scripts/                  # dev-up.sh, install-oracle.sh
+tests/                    # Anchor integration tests
+.github/workflows/ci.yml  # CI pipeline
+```
+
+## License
+
+Apache 2.0 — see `LICENSE`.

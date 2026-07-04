@@ -1,0 +1,50 @@
+# ------------------------------------------------------------------
+# TabulaMarkets — reproducible dev/staging deploy.
+#
+# Boot everything:
+#   docker compose up --build
+#
+# The oracle uses the mock TabFM backend by default so the stack starts
+# in ~10s and needs no GPU. Set INSTALL_TABFM=true to build with the
+# real model, and TABULA_ORACLE_MOCK=0 in the oracle env to enable it.
+# ------------------------------------------------------------------
+services:
+  oracle:
+    build:
+      context: .
+      dockerfile: oracle/Dockerfile
+      args:
+        INSTALL_TABFM: "false"
+    image: tabula-oracle:local
+    environment:
+      TABULA_ORACLE_MOCK: "1"    # flip to 0 once INSTALL_TABFM=true above
+      TABULA_ENSEMBLE_SIZE: "16"
+      LOG_JSON: "1"
+      LOG_LEVEL: "info"
+    ports:
+      - "8787:8787"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/healthz',timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+  keeper:
+    build:
+      context: .
+      dockerfile: keeper/Dockerfile
+    image: tabula-keeper:local
+    depends_on:
+      oracle: { condition: service_healthy }
+    env_file:
+      # Copy keeper/.env.example → keeper/.env and fill in the real values.
+      - keeper/.env
+    environment:
+      ORACLE_URL: http://oracle:8787
+      JSON_LOGS: "1"
+      METRICS_PORT: "9464"
+    ports:
+      - "9464:9464"     # prometheus /metrics + /healthz
+    restart: unless-stopped

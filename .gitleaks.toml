@@ -1,0 +1,45 @@
+# gitleaks config for TabulaMarkets. Extends the default ruleset with
+# Solana- and TxLINE-specific detectors.
+title = "TabulaMarkets gitleaks"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id          = "solana-keypair-json"
+description = "Solana secret-key JSON array"
+regex       = '''"secretKey"\s*:\s*\[(?:\s*\d+\s*,){63,}\s*\d+\s*\]'''
+tags        = ["solana", "key"]
+
+[[rules]]
+id          = "solana-keypair-array"
+description = "Raw 64-byte Solana keypair array"
+regex       = '''\[(?:\s*\d{1,3}\s*,){63,}\s*\d{1,3}\s*\]'''
+tags        = ["solana", "key"]
+
+[[rules]]
+id          = "txline-api-token"
+description = "TxLINE X-Api-Token header value"
+regex       = '''(?i)(x-api-token["'\s:=]+)([A-Za-z0-9_\-]{32,})'''
+secretGroup = 2
+tags        = ["txline"]
+
+[[rules]]
+id          = "generic-jwt"
+description = "JWT (Bearer or standalone)"
+regex       = '''\beyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\b'''
+tags        = ["jwt"]
+
+[allowlist]
+description = "Ignore fixtures and documentation examples"
+paths = [
+  '''(^|/)README\.md$''',
+  '''(^|/)docs/''',
+  '''(^|/)\.env\.example$''',
+  '''(^|/)\.gitleaks\.toml$''',
+]
+regexes = [
+  '''TabuLA1{20,}''',
+  '''TxLiNe1{20,}''',
+  '''EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v''',
+]
