@@ -35,7 +35,7 @@ use txline_mock::cpi::accounts::ValidateStat as TxLineValidateStatAccounts;
 #[cfg(feature = "mock-txline")]
 use txline_mock::program::TxlineMock;
 #[cfg(feature = "mock-txline")]
-use txline_mock::{self, StatReceipt as MockStatReceipt};
+use txline_mock::{self, StatReceipt as MockStatReceipt, StatRoot as MockStatRoot};
 
 declare_id!("GZ6F2Q5DWQopyxcyTQk7Jko58Fc9jPdEdGdfiSZS7Z9T");
 
@@ -391,14 +391,19 @@ pub mod tabula_markets {
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
         txline_mock::cpi::validate_stat(cpi_ctx, stat_type, stat_value, proof)?;
 
+        // Seeds bind the receipt PDA address above. Owner is enforced here
+        // (receipt may be created by the CPI via init_if_needed, so it stays
+        // UncheckedAccount and cannot be typed as Account before CPI).
+        require_keys_eq!(*ctx.accounts.receipt.owner, txline_mock::ID);
         let receipt_data = ctx.accounts.receipt.try_borrow_data()?;
         let account = MockStatReceipt::try_deserialize(&mut &receipt_data[..])?;
         require!(account.verified, TabulaError::TxLineNotVerified);
         require!(account.stat_type == stat_type, TabulaError::StatTypeMismatch);
         require!(account.match_id == market.match_id, TabulaError::MatchIdMismatch);
+        let stat_value = account.stat_value;
         drop(receipt_data);
 
-        resolve_market(market, account.stat_value)
+        resolve_market(market, stat_value)
     }
 
     // ---------------------------------------------------------------
@@ -783,12 +788,22 @@ pub struct SettleViaTxLineMock<'info> {
         constraint = market.pool == pool.key() @ TabulaError::MarketPoolMismatch)]
     pub market: Account<'info, Market>,
 
-    /// CHECK: verified by TxLINE CPI
-    #[account(mut)]
-    pub stat_root: UncheckedAccount<'info>,
+    /// TxLINE-owned stat root PDA (published before settle).
+    #[account(
+        seeds = [b"stat-root", market.match_id.as_ref()],
+        bump = stat_root.bump,
+        seeds::program = txline_program.key(),
+    )]
+    pub stat_root: Account<'info, MockStatRoot>,
 
-    /// CHECK: written by TxLINE CPI, deserialized manually
-    #[account(mut)]
+    /// CHECK: PDA address bound to txline-mock; may be uninitialized until
+    /// the validate_stat CPI (`init_if_needed`). Owner + data checked after CPI.
+    #[account(
+        mut,
+        seeds = [b"receipt", stat_root.key().as_ref(), market.match_id.as_ref()],
+        bump,
+        seeds::program = txline_program.key(),
+    )]
     pub receipt: UncheckedAccount<'info>,
 
     pub txline_program: Program<'info, TxlineMock>,
