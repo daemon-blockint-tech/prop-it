@@ -13,7 +13,7 @@ dependencies = [
     "pandas>=2.2,<3.0",
     "scikit-learn>=1.5,<2.0",
     "huggingface_hub>=0.24,<1.0",
-    "structlog>=24.4,<26.0",
+    "structlog>=24.4,<27.0",
     "prometheus-client>=0.20,<1.0",
     # Torch pin. Users targeting GPU should install the CUDA wheel first,
     # matching this version (e.g. torch==2.4.1+cu121).
