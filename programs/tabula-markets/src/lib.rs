@@ -26,11 +26,9 @@ use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 #[cfg(feature = "mock-txline")]
 use txline_mock::cpi::accounts::ValidateStat as TxLineValidateStatAccounts;
 #[cfg(feature = "mock-txline")]
-use txline_mock::program::TxlineMock;
-#[cfg(feature = "mock-txline")]
 use txline_mock::{self, StatReceipt as MockStatReceipt};
 
-declare_id!("TabuLA11111111111111111111111111111111111111");
+declare_id!("573udr4SsUoFYV5H9o9Mj3wWrhPyT4K8YVRkXsdyWyjH");
 
 pub const Q_SCALE: u64        = 1_000_000;
 pub const MAX_OUTCOMES: usize = 10;
@@ -334,78 +332,115 @@ pub mod tabula_markets {
     // ---------------------------------------------------------------
     // Settlement — mock backend
     // ---------------------------------------------------------------
-    #[cfg(feature = "mock-txline")]
-    pub fn settle_via_txline(
+    //
+    // NOTE on feature gating: Anchor 0.30's `#[program]` macro places *every*
+    // handler into the instruction dispatch table and emits client-account glue
+    // for it, without honouring `#[cfg]` on the handler. A settlement
+    // instruction therefore cannot be conditionally compiled out at the `fn`
+    // level. Instead each backend's instruction is always present, and the
+    // feature flag selects which one has a live body — the other returns
+    // `SettlementBackendDisabled`. The mock body is additionally the only one
+    // that references the optional `txline-mock` crate, so it *must* be gated
+    // out under `real-txline` to compile at all.
+    pub fn settle_via_txline_mock(
         ctx: Context<SettleViaTxLineMock>,
         stat_type: [u8; 16],
         stat_value: u64,
         proof: Vec<[u8; 32]>,
     ) -> Result<()> {
-        require!(!ctx.accounts.pool.paused, TabulaError::PoolPaused);
+        #[cfg(not(feature = "mock-txline"))]
+        {
+            let _ = (&ctx, &stat_type, stat_value, &proof);
+            return err!(TabulaError::SettlementBackendDisabled);
+        }
 
-        let market = &mut ctx.accounts.market;
-        require!(market.status == MarketStatus::Trading as u8, TabulaError::AlreadySettled);
-        require!(market.stat_type == stat_type, TabulaError::StatTypeMismatch);
+        #[cfg(feature = "mock-txline")]
+        {
+            require!(!ctx.accounts.pool.paused, TabulaError::PoolPaused);
 
-        let cpi_program  = ctx.accounts.txline_program.to_account_info();
-        let cpi_accounts = TxLineValidateStatAccounts {
-            payer:          ctx.accounts.payer.to_account_info(),
-            stat_root:      ctx.accounts.stat_root.to_account_info(),
-            receipt:        ctx.accounts.receipt.to_account_info(),
-            system_program: ctx.accounts.system_program.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-        txline_mock::cpi::validate_stat(cpi_ctx, stat_type, stat_value, proof)?;
+            let market = &mut ctx.accounts.market;
+            require!(market.status == MarketStatus::Trading as u8, TabulaError::AlreadySettled);
+            require!(market.stat_type == stat_type, TabulaError::StatTypeMismatch);
+            require_keys_eq!(
+                ctx.accounts.txline_program.key(),
+                txline_mock::ID,
+                TabulaError::InvalidTxLineProgram
+            );
 
-        let receipt_data = ctx.accounts.receipt.try_borrow_data()?;
-        let account = MockStatReceipt::try_deserialize(&mut &receipt_data[..])?;
-        require!(account.verified, TabulaError::TxLineNotVerified);
-        require!(account.stat_type == stat_type, TabulaError::StatTypeMismatch);
-        require!(account.match_id == market.match_id, TabulaError::MatchIdMismatch);
-        drop(receipt_data);
+            let cpi_program  = ctx.accounts.txline_program.to_account_info();
+            let cpi_accounts = TxLineValidateStatAccounts {
+                payer:          ctx.accounts.payer.to_account_info(),
+                stat_root:      ctx.accounts.stat_root.to_account_info(),
+                receipt:        ctx.accounts.receipt.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+            };
+            let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+            txline_mock::cpi::validate_stat(cpi_ctx, stat_type, stat_value, proof)?;
 
-        resolve_market(market, account.stat_value)
+            let receipt_data = ctx.accounts.receipt.try_borrow_data()?;
+            let account = MockStatReceipt::try_deserialize(&mut &receipt_data[..])?;
+            require!(account.verified, TabulaError::TxLineNotVerified);
+            require!(account.stat_type == stat_type, TabulaError::StatTypeMismatch);
+            require!(account.match_id == market.match_id, TabulaError::MatchIdMismatch);
+            drop(receipt_data);
+
+            return resolve_market(market, account.stat_value);
+        }
+
+        #[allow(unreachable_code)]
+        Ok(())
     }
 
     // ---------------------------------------------------------------
     // Settlement — real backend
     // ---------------------------------------------------------------
-    #[cfg(feature = "real-txline")]
-    pub fn settle_via_txline(
+    pub fn settle_via_txline_real(
         ctx: Context<SettleViaTxLineReal>,
         stat_value: u64,
         _txodds_fixture_id: u64,
         _txodds_seq: u32,
         _txodds_stat_key: u16,
     ) -> Result<()> {
-        require!(!ctx.accounts.pool.paused, TabulaError::PoolPaused);
+        #[cfg(not(feature = "real-txline"))]
+        {
+            let _ = (&ctx, stat_value);
+            return err!(TabulaError::SettlementBackendDisabled);
+        }
 
-        // Signer must be the pool's settlement oracle (keeper) which has
-        // executed `validateStat.view()` against the real TxODDS program.
-        require_keys_eq!(
-            ctx.accounts.settlement_oracle.key(),
-            ctx.accounts.pool.settlement_oracle,
-            TabulaError::OracleUnauthorized
-        );
+        #[cfg(feature = "real-txline")]
+        {
+            require!(!ctx.accounts.pool.paused, TabulaError::PoolPaused);
 
-        let market = &mut ctx.accounts.market;
-        require!(market.status == MarketStatus::Trading as u8, TabulaError::AlreadySettled);
+            // Signer must be the pool's settlement oracle (keeper) which has
+            // executed `validateStat.view()` against the real TxODDS program.
+            require_keys_eq!(
+                ctx.accounts.settlement_oracle.key(),
+                ctx.accounts.pool.settlement_oracle,
+                TabulaError::OracleUnauthorized
+            );
 
-        // Freshness check: settlement must happen close to when the keeper
-        // observed the on-chain Merkle validation.
-        let now = Clock::get()?.unix_timestamp;
-        let age = now.checked_sub(ctx.accounts.attestation.attested_at).unwrap_or(i64::MAX);
-        require!(age >= 0 && age <= MAX_RECEIPT_AGE_SEC, TabulaError::AttestationExpired);
-        require!(ctx.accounts.attestation.match_id == market.match_id, TabulaError::MatchIdMismatch);
-        require!(ctx.accounts.attestation.stat_type == market.stat_type, TabulaError::StatTypeMismatch);
-        require!(ctx.accounts.attestation.stat_value == stat_value, TabulaError::StatValueMismatch);
-        require_keys_eq!(
-            ctx.accounts.attestation.settlement_oracle,
-            ctx.accounts.pool.settlement_oracle,
-            TabulaError::OracleUnauthorized
-        );
+            let market = &mut ctx.accounts.market;
+            require!(market.status == MarketStatus::Trading as u8, TabulaError::AlreadySettled);
 
-        resolve_market(market, stat_value)
+            // Freshness check: settlement must happen close to when the keeper
+            // observed the on-chain Merkle validation.
+            let now = Clock::get()?.unix_timestamp;
+            let age = now.checked_sub(ctx.accounts.attestation.attested_at).unwrap_or(i64::MAX);
+            require!(age >= 0 && age <= MAX_RECEIPT_AGE_SEC, TabulaError::AttestationExpired);
+            require!(ctx.accounts.attestation.match_id == market.match_id, TabulaError::MatchIdMismatch);
+            require!(ctx.accounts.attestation.stat_type == market.stat_type, TabulaError::StatTypeMismatch);
+            require!(ctx.accounts.attestation.stat_value == stat_value, TabulaError::StatValueMismatch);
+            require_keys_eq!(
+                ctx.accounts.attestation.settlement_oracle,
+                ctx.accounts.pool.settlement_oracle,
+                TabulaError::OracleUnauthorized
+            );
+
+            return resolve_market(market, stat_value);
+        }
+
+        #[allow(unreachable_code)]
+        Ok(())
     }
 
     // ---------------------------------------------------------------
@@ -464,7 +499,6 @@ pub mod tabula_markets {
     // Real-txline: keeper posts a signed attestation account describing the
     // outcome of a successful `validateStat` on the TxODDS program.
     // ---------------------------------------------------------------
-    #[cfg(feature = "real-txline")]
     pub fn post_txline_attestation(
         ctx: Context<PostTxLineAttestation>,
         match_id: [u8; 32],
@@ -474,22 +508,35 @@ pub mod tabula_markets {
         txodds_seq: u32,
         txodds_stat_key: u16,
     ) -> Result<()> {
-        require_keys_eq!(
-            ctx.accounts.settlement_oracle.key(),
-            ctx.accounts.pool.settlement_oracle,
-            TabulaError::OracleUnauthorized
-        );
-        let att = &mut ctx.accounts.attestation;
-        att.match_id           = match_id;
-        att.stat_type          = stat_type;
-        att.stat_value         = stat_value;
-        att.txodds_fixture_id  = txodds_fixture_id;
-        att.txodds_seq         = txodds_seq;
-        att.txodds_stat_key    = txodds_stat_key;
-        att.settlement_oracle  = ctx.accounts.settlement_oracle.key();
-        att.attested_at        = Clock::get()?.unix_timestamp;
-        att.bump               = ctx.bumps.attestation;
-        emit!(AttestationPosted { match_id, stat_value });
+        #[cfg(not(feature = "real-txline"))]
+        {
+            let _ = (&ctx, &match_id, &stat_type, stat_value,
+                     txodds_fixture_id, txodds_seq, txodds_stat_key);
+            return err!(TabulaError::SettlementBackendDisabled);
+        }
+
+        #[cfg(feature = "real-txline")]
+        {
+            require_keys_eq!(
+                ctx.accounts.settlement_oracle.key(),
+                ctx.accounts.pool.settlement_oracle,
+                TabulaError::OracleUnauthorized
+            );
+            let att = &mut ctx.accounts.attestation;
+            att.match_id           = match_id;
+            att.stat_type          = stat_type;
+            att.stat_value         = stat_value;
+            att.txodds_fixture_id  = txodds_fixture_id;
+            att.txodds_seq         = txodds_seq;
+            att.txodds_stat_key    = txodds_stat_key;
+            att.settlement_oracle  = ctx.accounts.settlement_oracle.key();
+            att.attested_at        = Clock::get()?.unix_timestamp;
+            att.bump               = ctx.bumps.attestation;
+            emit!(AttestationPosted { match_id, stat_value });
+            return Ok(());
+        }
+
+        #[allow(unreachable_code)]
         Ok(())
     }
 }
@@ -650,7 +697,15 @@ pub struct PlaceBet<'info> {
     pub system_program: Program<'info, System>,
 }
 
-#[cfg(feature = "mock-txline")]
+// NOTE: this account struct is compiled under *both* feature flags even though
+// its handler (`settle_via_txline_mock`) is `mock-txline`-only. Anchor's
+// `#[program]` macro emits `__client_accounts_*` client glue for every handler
+// without propagating the handler's `#[cfg]`, so the struct (and therefore its
+// generated module) must exist under `real-txline` too or the glue fails to
+// resolve. The `txline_program` is an `UncheckedAccount` (rather than
+// `Program<'info, TxlineMock>`) so this struct carries no dependency on the
+// optional `txline-mock` crate; the handler verifies its key against
+// `txline_mock::ID` at runtime.
 #[derive(Accounts)]
 pub struct SettleViaTxLineMock<'info> {
     #[account(mut)]
@@ -670,11 +725,13 @@ pub struct SettleViaTxLineMock<'info> {
     #[account(mut)]
     pub receipt: UncheckedAccount<'info>,
 
-    pub txline_program: Program<'info, TxlineMock>,
+    /// CHECK: key is verified against `txline_mock::ID` inside the handler.
+    pub txline_program: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
-#[cfg(feature = "real-txline")]
+// Compiled under both features (see the note on `SettleViaTxLineMock`); the
+// `settle_via_txline_real` handler that consumes it stays `real-txline`-only.
 #[derive(Accounts)]
 pub struct SettleViaTxLineReal<'info> {
     #[account(mut)]
@@ -694,7 +751,8 @@ pub struct SettleViaTxLineReal<'info> {
     pub attestation: Account<'info, TxLineAttestation>,
 }
 
-#[cfg(feature = "real-txline")]
+// Compiled under both features (see the note on `SettleViaTxLineMock`); the
+// `post_txline_attestation` handler that consumes it stays `real-txline`-only.
 #[derive(Accounts)]
 #[instruction(match_id: [u8; 32])]
 pub struct PostTxLineAttestation<'info> {
@@ -861,6 +919,8 @@ pub enum TabulaError {
     #[msg("Stat value mismatch vs attestation")]              StatValueMismatch,
     #[msg("Match id mismatch vs receipt/attestation")]        MatchIdMismatch,
     #[msg("TxLINE did not verify the stat")]                  TxLineNotVerified,
+    #[msg("Provided TxLINE program does not match txline_mock::ID")] InvalidTxLineProgram,
+    #[msg("This settlement backend is disabled in the current build")] SettlementBackendDisabled,
     #[msg("Stat value fell outside all defined bins")]        StatValueOutOfBins,
     #[msg("Share calculation underflow")]                     ShareCalcUnderflow,
     #[msg("Only the market oracle may update predictions")]   OracleUnauthorized,
