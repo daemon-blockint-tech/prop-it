@@ -74,7 +74,7 @@ pub mod txline_mock {
         let root = &ctx.accounts.stat_root;
 
         // Leaf format: keccak256(stat_type || stat_value_le_bytes)
-        let mut leaf_pre = Vec::with_capacity(16 + 8);
+        let mut leaf_pre = Vec::with_capacity(24);
         leaf_pre.extend_from_slice(&stat_type);
         leaf_pre.extend_from_slice(&stat_value.to_le_bytes());
         let mut node = keccak::hash(&leaf_pre).to_bytes();
@@ -122,7 +122,7 @@ pub struct Initialize<'info> {
     #[account(
         init,
         payer = authority,
-        space = 8 + TxLineConfig::INIT_SPACE,
+        space = TxLineConfig::SPACE,
         seeds = [b"config"],
         bump,
     )]
@@ -146,7 +146,7 @@ pub struct PublishStatRoot<'info> {
     #[account(
         init,
         payer = authority,
-        space = 8 + StatRoot::INIT_SPACE,
+        space = StatRoot::SPACE,
         seeds = [b"stat-root", match_id.as_ref()],
         bump,
     )]
@@ -171,7 +171,7 @@ pub struct ValidateStat<'info> {
     #[account(
         init_if_needed,
         payer = payer,
-        space = 8 + StatReceipt::INIT_SPACE,
+        space = StatReceipt::SPACE,
         seeds = [b"receipt", stat_root.key().as_ref(), stat_root.match_id.as_ref()],
         bump,
     )]
@@ -190,6 +190,10 @@ pub struct TxLineConfig {
     pub authority: Pubkey,
     pub bump:      u8,
 }
+impl TxLineConfig {
+    /// authority(32) + bump(1) + discriminator(8)
+    pub const SPACE: usize = 41;
+}
 
 #[account]
 #[derive(InitSpace)]
@@ -200,6 +204,10 @@ pub struct StatRoot {
     pub published_at: i64,
     pub bump:         u8,
 }
+impl StatRoot {
+    /// match_id(32) + merkle_root(32) + authority(32) + published_at(8) + bump(1) + disc(8)
+    pub const SPACE: usize = 113;
+}
 
 #[account]
 #[derive(InitSpace)]
@@ -209,6 +217,10 @@ pub struct StatReceipt {
     pub stat_value:  u64,
     pub verified:    bool,
     pub verified_at: i64,
+}
+impl StatReceipt {
+    /// match_id(32) + stat_type(16) + stat_value(8) + verified(1) + verified_at(8) + disc(8)
+    pub const SPACE: usize = 73;
 }
 
 // --------------------------------------------------------------------------

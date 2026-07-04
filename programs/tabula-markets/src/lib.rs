@@ -41,6 +41,8 @@ declare_id!("GZ6F2Q5DWQopyxcyTQk7Jko58Fc9jPdEdGdfiSZS7Z9T");
 
 pub const Q_SCALE: u64        = 1_000_000;
 pub const MAX_OUTCOMES: usize = 10;
+/// Bin edges are one past the last outcome (`MAX_OUTCOMES + 1`).
+pub const MAX_BIN_EDGES: usize = 11;
 pub const FEE_BPS: u16        = 200;      // 2% spread routed to LP treasury
 pub const SETTLE_FEE_BPS: u16 = 50;       // 0.5% off net winnings on payout
 
@@ -54,7 +56,7 @@ pub const MAX_MARKET_EXPOSURE: u64 = 1_000_000_000_000; // 1M USDC
 
 /// Reject settlement receipts older than this. Guards against replay of
 /// stale keeper-signed receipts on the real-txline path.
-pub const MAX_RECEIPT_AGE_SEC: i64 = 15 * 60;
+pub const MAX_RECEIPT_AGE_SEC: i64 = 900; // 15 minutes
 
 #[program]
 pub mod tabula_markets {
@@ -178,10 +180,10 @@ pub mod tabula_markets {
             (outcome_count as usize) <= MAX_OUTCOMES && outcome_count >= 2,
             TabulaError::OutcomeCountOutOfRange
         );
-        require!(
-            bin_edges.len() == outcome_count as usize + 1,
-            TabulaError::BinEdgeMismatch
-        );
+        let expected_edges = (outcome_count as usize)
+            .checked_add(1)
+            .ok_or(error!(TabulaError::ArithmeticOverflow))?;
+        require!(bin_edges.len() == expected_edges, TabulaError::BinEdgeMismatch);
         require!(
             initial_probs.len() == outcome_count as usize,
             TabulaError::ProbCountMismatch
@@ -199,7 +201,7 @@ pub mod tabula_markets {
         market.match_id        = match_id;
         market.stat_type       = stat_type;
         market.outcome_count   = outcome_count;
-        market.bin_edges       = [0u64; MAX_OUTCOMES + 1];
+        market.bin_edges       = [0u64; MAX_BIN_EDGES];
         market.probs           = [0u64; MAX_OUTCOMES];
         market.q               = [0i64; MAX_OUTCOMES];
         market.liquidity_b     = liquidity_b;
@@ -595,7 +597,10 @@ fn resolve_market(market: &mut Account<Market>, stat_value: u64) -> Result<()> {
     let mut winning: Option<u8> = None;
     for i in 0..market.outcome_count as usize {
         let lo = market.bin_edges[i];
-        let hi = market.bin_edges[i + 1];
+        let hi_idx = i
+            .checked_add(1)
+            .ok_or(error!(TabulaError::ArithmeticOverflow))?;
+        let hi = market.bin_edges[hi_idx];
         if stat_value >= lo && stat_value < hi {
             winning = Some(i as u8);
             break;
@@ -625,7 +630,7 @@ pub struct InitializeGlobal<'info> {
     #[account(
         init,
         payer = admin,
-        space = 8 + GlobalConfig::MAX_SIZE,
+        space = GlobalConfig::SPACE,
         seeds = [b"global"],
         bump,
     )]
@@ -647,7 +652,7 @@ pub struct InitializePool<'info> {
 
     #[account(
         init, payer = admin,
-        space = 8 + Pool::MAX_SIZE,
+        space = Pool::SPACE,
         seeds = [b"pool", usdc_mint.key().as_ref()],
         bump,
     )]
@@ -670,7 +675,6 @@ pub struct InitializePool<'info> {
 
     pub token_program:  Program<'info, Token>,
     pub system_program: Program<'info, System>,
-    pub rent:           Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
@@ -712,7 +716,7 @@ pub struct CreateMarket<'info> {
 
     #[account(
         init, payer = creator,
-        space = 8 + Market::MAX_SIZE,
+        space = Market::SPACE,
         seeds = [b"market", pool.key().as_ref(), match_id.as_ref()],
         bump,
     )]
@@ -736,7 +740,6 @@ pub struct UpdatePrediction<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(outcome_idx: u8)]
 pub struct PlaceBet<'info> {
     #[account(mut)]
     pub bettor: Signer<'info>,
@@ -753,7 +756,7 @@ pub struct PlaceBet<'info> {
     #[account(
         init_if_needed,
         payer = bettor,
-        space = 8 + Position::MAX_SIZE,
+        space = Position::SPACE,
         seeds = [b"position", market.key().as_ref(), bettor.key().as_ref()],
         bump,
     )]
@@ -854,7 +857,7 @@ pub struct PostTxLineAttestation<'info> {
     #[account(
         init,
         payer = payer,
-        space = 8 + TxLineAttestation::MAX_SIZE,
+        space = TxLineAttestation::SPACE,
         seeds = [b"attestation", pool.key().as_ref(), market.key().as_ref()],
         bump,
     )]
@@ -903,15 +906,18 @@ pub struct ClaimWinnings<'info> {
 // ---------------------------------------------------------------
 
 #[account]
+#[derive(InitSpace)]
 pub struct GlobalConfig {
     pub admin: Pubkey,
     pub bump:  u8,
 }
 impl GlobalConfig {
-    pub const MAX_SIZE: usize = 32 + 1;
+    /// Precomputed account space (discriminator + data) for solana-vscode.
+    pub const SPACE: usize = 41;
 }
 
 #[account]
+#[derive(InitSpace)]
 pub struct Pool {
     pub authority:         Pubkey,
     pub oracle_authority:  Pubkey,   // signs update_prediction
@@ -924,15 +930,18 @@ pub struct Pool {
     pub bump:              u8,
     pub vault_bump:        u8,
 }
-impl Pool { pub const MAX_SIZE: usize = 32*5 + 8*2 + 1*3; }
+impl Pool {
+    pub const SPACE: usize = 187;
+}
 
 #[account]
+#[derive(InitSpace)]
 pub struct Market {
     pub pool:             Pubkey,
     pub match_id:         [u8; 32],
     pub stat_type:        [u8; 16],
     pub outcome_count:    u8,
-    pub bin_edges:        [u64; MAX_OUTCOMES + 1],
+    pub bin_edges:        [u64; MAX_BIN_EDGES],
     pub probs:            [u64; MAX_OUTCOMES],
     pub q:                [i64; MAX_OUTCOMES],
     pub liquidity_b:      u64,
@@ -944,16 +953,11 @@ pub struct Market {
     pub bump:             u8,
 }
 impl Market {
-    pub const MAX_SIZE: usize =
-        32 // pool
-        + 32 + 16 + 1
-        + 8 * (MAX_OUTCOMES + 1)
-        + 8 * MAX_OUTCOMES
-        + 8 * MAX_OUTCOMES
-        + 8 + 1 + 1 + 32 + 8 + 1;
+    pub const SPACE: usize = 388;
 }
 
 #[account]
+#[derive(InitSpace)]
 pub struct Position {
     pub owner:       Pubkey,
     pub market:      Pubkey,
@@ -963,9 +967,12 @@ pub struct Position {
     pub claimed:     bool,
     pub bump:        u8,
 }
-impl Position { pub const MAX_SIZE: usize = 32*2 + 1 + 8 + 8 + 1 + 1; }
+impl Position {
+    pub const SPACE: usize = 91;
+}
 
 #[account]
+#[derive(InitSpace)]
 pub struct TxLineAttestation {
     pub match_id:           [u8; 32],
     pub stat_type:          [u8; 16],
@@ -979,7 +986,7 @@ pub struct TxLineAttestation {
     pub bump:               u8,
 }
 impl TxLineAttestation {
-    pub const MAX_SIZE: usize = 32 + 16 + 8 + 8 + 4 + 2 + 32 + 8 + 1 + 1;
+    pub const SPACE: usize = 120;
 }
 
 #[repr(u8)]

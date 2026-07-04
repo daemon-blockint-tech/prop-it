@@ -104,7 +104,6 @@ describe("tabula-markets", () => {
         vaultAuthority: vaultAuth,
         tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
-        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
       })
       .rpc();
 
