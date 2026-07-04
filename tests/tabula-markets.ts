@@ -150,10 +150,11 @@ describe("tabula-markets", () => {
 
     const proof = [leaves[1], Buffer.from(l23)].map((b) => Array.from(b));
 
-    await tabula.methods.settleViaTxline(
+    await tabula.methods.settleViaTxlineMock(
         Array.from(statType), new BN(5), proof)
       .accounts({
         payer: authority.publicKey,
+        pool: poolPda,
         market: marketPda,
         statRoot: statRootPda,
         receipt: receiptPda,

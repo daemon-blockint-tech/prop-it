@@ -56,7 +56,7 @@ const txlineDefaults = TXLINE_ADDRESSES[txlineCluster];
 // declare_id! placeholder is fine; on devnet/mainnet you MUST override.
 const tabulaProgramId = optionalPubkey(
   "TABULA_PROGRAM_ID",
-  "TabuLA11111111111111111111111111111111111111",
+  "573udr4SsUoFYV5H9o9Mj3wWrhPyT4K8YVRkXsdyWyjH",
 )!;
 
 // TxLINE program id — defaults to the canonical devnet/mainnet address
@@ -64,7 +64,7 @@ const tabulaProgramId = optionalPubkey(
 const txlineProgramId = optionalPubkey(
   "TXLINE_PROGRAM_ID",
   cluster === "localnet"
-    ? "TxLiNe11111111111111111111111111111111111111"
+    ? "Bi9Q6ovkrnBHHauZctkTkQ9PoFj8xTpswNBGDCe9mW3t"
     : txlineDefaults.programId.toBase58(),
 )!;
 

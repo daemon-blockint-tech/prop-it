@@ -26,6 +26,6 @@ real-txline = []
 default     = ["mock-txline"]
 
 [dependencies]
-anchor-lang = "0.30.1"
+anchor-lang = { version = "0.30.1", features = ["init-if-needed"] }
 anchor-spl  = "0.30.1"
 txline-mock = { path = "../txline-mock", features = ["cpi"], optional = true }
