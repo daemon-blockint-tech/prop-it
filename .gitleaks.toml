@@ -39,7 +39,8 @@ paths = [
   '''(^|/)\.gitleaks\.toml$''',
 ]
 regexes = [
-  '''TabuLA1{20,}''',
-  '''TxLiNe1{20,}''',
+  # Placeholder program IDs — public keys, not secrets. Replaced at deploy.
+  '''573udr4SsUoFYV5H9o9Mj3wWrhPyT4K8YVRkXsdyWyjH''',
+  '''Bi9Q6ovkrnBHHauZctkTkQ9PoFj8xTpswNBGDCe9mW3t''',
   '''EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v''',
 ]
