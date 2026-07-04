@@ -1,0 +1,24 @@
+[project]
+name = "tabula-oracle"
+version = "0.1.0"
+description = "TabFM-driven probability oracle for TabulaMarkets prop-bet AMM"
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "scikit-learn>=1.5",
+    "torch>=2.4",
+    "huggingface_hub>=0.24",
+    # TabFM installed via: pip install "tabfm[pytorch] @ git+https://github.com/google-research/tabfm.git"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+
+[tool.setuptools]
+packages = ["tabula_oracle"]
