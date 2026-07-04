@@ -33,6 +33,8 @@ dist/
 .turbo/
 *.log
 npm-debug.log*
+package-lock.json
+next-env.d.ts
 yarn-debug.log*
 pnpm-debug.log*
 
