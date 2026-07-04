@@ -109,14 +109,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - name: Build oracle image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: oracle/Dockerfile
           push: false
           tags: tabula-oracle:ci
       - name: Build keeper image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: keeper/Dockerfile
