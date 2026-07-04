@@ -16,7 +16,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::keccak;
 
-declare_id!("TxLiNe11111111111111111111111111111111111111");
+declare_id!("Cx7NL2thRV167d1PaMUgiARvTwLua34KQ7S5qkTBH4oE");
 
 #[program]
 pub mod txline_mock {

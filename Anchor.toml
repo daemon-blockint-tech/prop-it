@@ -7,12 +7,12 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-tabula_markets = "TabuLA11111111111111111111111111111111111111"
-txline_mock    = "TxLiNe11111111111111111111111111111111111111"
+tabula_markets = "Fd6fiHspckMKwwSDPkJHmnp69sQewApDVd7kQc4zUboR"
+txline_mock    = "Cx7NL2thRV167d1PaMUgiARvTwLua34KQ7S5qkTBH4oE"
 
 [programs.devnet]
-tabula_markets = "TabuLA11111111111111111111111111111111111111"
-txline_mock    = "TxLiNe11111111111111111111111111111111111111"
+tabula_markets = "Fd6fiHspckMKwwSDPkJHmnp69sQewApDVd7kQc4zUboR"
+txline_mock    = "Cx7NL2thRV167d1PaMUgiARvTwLua34KQ7S5qkTBH4oE"
 
 [registry]
 url = "https://api.apr.dev"

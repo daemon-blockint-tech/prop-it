@@ -30,7 +30,7 @@ use txline_mock::program::TxlineMock;
 #[cfg(feature = "mock-txline")]
 use txline_mock::{self, StatReceipt as MockStatReceipt};
 
-declare_id!("TabuLA11111111111111111111111111111111111111");
+declare_id!("Fd6fiHspckMKwwSDPkJHmnp69sQewApDVd7kQc4zUboR");
 
 pub const Q_SCALE: u64        = 1_000_000;
 pub const MAX_OUTCOMES: usize = 10;
