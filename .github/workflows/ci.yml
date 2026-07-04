@@ -107,7 +107,7 @@ jobs:
     needs: [oracle, node]
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Build oracle image
         uses: docker/build-push-action@v6
         with:
