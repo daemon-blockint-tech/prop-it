@@ -171,7 +171,7 @@ pub struct ValidateStat<'info> {
     #[account(
         init_if_needed,
         payer = payer,
-        space = 8 + StatReceipt::MAX_SIZE,
+        space = 8 + StatReceipt::INIT_SPACE,
         seeds = [b"receipt", stat_root.key().as_ref(), stat_root.match_id.as_ref()],
         bump,
     )]
@@ -185,15 +185,14 @@ pub struct ValidateStat<'info> {
 // --------------------------------------------------------------------------
 
 #[account]
+#[derive(InitSpace)]
 pub struct TxLineConfig {
     pub authority: Pubkey,
     pub bump:      u8,
 }
-impl TxLineConfig {
-    pub const MAX_SIZE: usize = 32 + 1;
-}
 
 #[account]
+#[derive(InitSpace)]
 pub struct StatRoot {
     pub match_id:     [u8; 32],
     pub merkle_root:  [u8; 32],
@@ -201,20 +200,15 @@ pub struct StatRoot {
     pub published_at: i64,
     pub bump:         u8,
 }
-impl StatRoot {
-    pub const MAX_SIZE: usize = 32 + 32 + 32 + 8 + 1;
-}
 
 #[account]
+#[derive(InitSpace)]
 pub struct StatReceipt {
     pub match_id:    [u8; 32],
     pub stat_type:   [u8; 16],
     pub stat_value:  u64,
     pub verified:    bool,
     pub verified_at: i64,
-}
-impl StatReceipt {
-    pub const MAX_SIZE: usize = 32 + 16 + 8 + 1 + 8;
 }
 
 // --------------------------------------------------------------------------
