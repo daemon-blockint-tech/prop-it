@@ -2,13 +2,20 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import axios from "axios";
+import { Transaction } from "@solana/web3.js";
+import { useConnection, useWallet } from "@solana/wallet-adapter-react";
+import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 import { MarketPanel } from "@/components/MarketPanel";
 import { ReceiptPanel } from "@/components/ReceiptPanel";
 import { OracleStatus } from "@/components/OracleStatus";
+import { placeBetIx, encodeFixedBytes } from "@/lib/tabula";
 
 const BIN_EDGES = [0, 3, 6, 9, 999];
 const BIN_LABELS = ["0–2 corners", "3–5 corners", "6–8 corners", "9+ corners"];
 const ORACLE_URL = process.env.NEXT_PUBLIC_ORACLE_URL ?? "http://127.0.0.1:8787";
+const MATCH_ID = "world-cup-2026-r16-arg-vs-fra";
+const STAT_TYPE = "corners_h2";
+const USDC_DECIMALS = 6;
 
 interface Snapshot {
   probs: number[];
@@ -24,11 +31,44 @@ export default function Page() {
   const [minute, setMinute] = useState(47);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [betStatus, setBetStatus] = useState<string | null>(null);
+  const [betting, setBetting] = useState(false);
+
+  const { connection } = useConnection();
+  const { publicKey, sendTransaction } = useWallet();
+  const { setVisible } = useWalletModal();
 
   const priceWithFee = useMemo(() => {
     if (!snap) return [];
     return snap.probs.map((p) => p * 1.02); // 2% spread mirroring FEE_BPS on-chain
   }, [snap]);
+
+  async function placeBet(outcomeIdx: number, stakeUsdc: number) {
+    if (!publicKey) {
+      setVisible(true);
+      return;
+    }
+    if (!(stakeUsdc > 0)) {
+      setBetStatus("enter a stake greater than 0");
+      return;
+    }
+    setBetting(true);
+    setBetStatus(`submitting bet on “${BIN_LABELS[outcomeIdx]}”…`);
+    try {
+      const matchId = encodeFixedBytes(MATCH_ID, 32);
+      const usdcAmount = BigInt(Math.round(stakeUsdc * 10 ** USDC_DECIMALS));
+      const ix = placeBetIx({ bettor: publicKey, matchId, outcomeIdx, usdcAmount });
+      const tx = new Transaction().add(ix);
+      const sig = await sendTransaction(tx, connection);
+      setBetStatus(`confirming ${sig.slice(0, 8)}…`);
+      await connection.confirmTransaction(sig, "confirmed");
+      setBetStatus(`bet confirmed: ${sig}`);
+    } catch (e: any) {
+      setBetStatus(`bet failed: ${e?.message ?? String(e)}`);
+    } finally {
+      setBetting(false);
+    }
+  }
 
   async function fetchPrediction(atMinute: number) {
     setBusy(true); setError(null);
@@ -76,11 +116,12 @@ export default function Page() {
           minute={minute}
           onMinuteChange={(m) => { setMinute(m); fetchPrediction(m); }}
           busy={busy}
+          walletConnected={!!publicKey}
+          onBet={placeBet}
+          betting={betting}
+          betStatus={betStatus}
         />
-        <ReceiptPanel
-          matchId="world-cup-2026-r16-arg-vs-fra"
-          statType="corners_h2"
-        />
+        <ReceiptPanel matchId={MATCH_ID} statType={STAT_TYPE} />
       </section>
       <aside className="space-y-6">
         <OracleStatus

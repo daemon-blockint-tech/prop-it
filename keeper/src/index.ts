@@ -6,16 +6,24 @@
  *   1. TxLINE  — via TxLineClient (guest JWT / apiToken) OR the local
  *                emulator on localnet.
  *   2. TabFM   — the FastAPI oracle at ORACLE_URL.
- *   3. Solana  — signs update_prediction / settle_via_txline txs.
+ *   3. Solana  — signs and submits update_prediction / settlement txs via
+ *                TabulaClient.
+ *
+ * Submission is real by default. `npm run simulate` sets KEEPER_DRY_RUN=1 to
+ * drive the oracle loop without a validator for local visualisation; that is
+ * an explicit simulator, not a silent no-op — the production entrypoints
+ * (`npm start`, `npm run dev`) always submit and fail closed if the RPC or
+ * keeper wallet is unavailable.
  *
  * Observability: structured JSON logging + Prometheus /metrics on
  * METRICS_PORT + /healthz /readyz probes.
  */
 
-import { cfg } from "./config.js";
+import { cfg, connection, keeperKeypair } from "./config.js";
 import { callOracle, oracleHealth } from "./oracle.js";
 import { LocalTxLineEmulator, MatchTick } from "./txlineFeed.js";
 import { TxLineClient } from "./txlineClient.js";
+import { TabulaClient, encodeFixedBytes } from "./tabulaClient.js";
 import { syntheticHistory } from "./history.js";
 import { log } from "./log.js";
 import { metrics, setHealth, startMetricsServer } from "./metrics.js";
@@ -26,7 +34,38 @@ const BIN_EDGES         = [0, 3, 6, 9, 999];
 const FINAL_CORNERS_H2  = Number(process.env.FINAL_CORNERS_H2 ?? 5);
 const BASE_B            = 5_000_000;
 const USE_REAL_FEED     = (process.env.USE_REAL_TXLINE ?? "0") === "1";
+const DRY_RUN           = (process.env.KEEPER_DRY_RUN ?? "0") === "1";
 const TXODDS_FIXTURE_ID = Number(process.env.TXODDS_FIXTURE_ID ?? 0);
+const TXODDS_SEQ        = Number(process.env.TXODDS_SEQ ?? 0);
+const TXODDS_STAT_KEY   = Number(process.env.TXODDS_STAT_KEY ?? 0);
+
+// On-chain [u8;32] / [u8;16] encodings must match those used at create_market.
+const MATCH_ID_BYTES  = encodeFixedBytes(MATCH_ID, 32);
+const STAT_TYPE_BYTES = encodeFixedBytes(STAT_TYPE, 16);
+
+/**
+ * Build the on-chain client unless we are in explicit dry-run (offline
+ * simulator) mode. Fails closed: a missing keeper wallet or RPC is a hard
+ * error in production, never a silent skip.
+ */
+function buildTabula(): TabulaClient | null {
+  if (DRY_RUN) {
+    log.warn({}, "KEEPER_DRY_RUN=1 — offline simulator, no on-chain submission");
+    return null;
+  }
+  const wallet = keeperKeypair();
+  const client = new TabulaClient({
+    connection: connection(),
+    programId:  cfg.tabulaProgramId,
+    usdcMint:   cfg.usdcMint,
+    wallet,
+  });
+  log.info(
+    { programId: cfg.tabulaProgramId.toBase58(), keeper: wallet.publicKey.toBase58(), pool: client.poolPda.toBase58() },
+    "tabula.client.ready",
+  );
+  return client;
+}
 
 async function main() {
   log.info({
@@ -35,9 +74,12 @@ async function main() {
     rpcUrl:      cfg.rpcUrl,
     metricsPort: cfg.metricsPort,
     realTxline:  USE_REAL_FEED,
+    dryRun:      DRY_RUN,
   }, "keeper.start");
 
   startMetricsServer();
+
+  const tabula = buildTabula();
 
   try {
     const h = await oracleHealth();
@@ -51,16 +93,53 @@ async function main() {
   log.info({ rows: history.length }, "history.loaded");
 
   if (USE_REAL_FEED) {
-    await runRealFeed(history);
+    await runRealFeed(history, tabula);
   } else {
-    await runLocalEmulator(history);
+    await runLocalEmulator(history, tabula);
   }
+}
+
+// ------------------------------------------------------------------
+// Submit helpers (real on-chain effect)
+// ------------------------------------------------------------------
+async function submitPrediction(
+  tabula: TabulaClient | null,
+  probsQ6: number[],
+  newB: number,
+): Promise<void> {
+  metrics.predictionsSent.inc({ match: MATCH_ID });
+  if (!tabula) {
+    log.info({ new_b: newB }, "dry_run.update_prediction");
+    return;
+  }
+  const sig = await tabula.submitUpdatePrediction(MATCH_ID_BYTES, probsQ6, newB);
+  log.info({ new_b: newB, sig }, "submitted.update_prediction");
+}
+
+async function submitSettlement(
+  tabula: TabulaClient | null,
+  statValue: number,
+): Promise<void> {
+  metrics.settlementsSent.inc({ match: MATCH_ID });
+  if (!tabula) {
+    log.info({ stat_value: statValue }, "dry_run.settle");
+    return;
+  }
+  const sig = await tabula.settleWithAttestation({
+    matchId:         MATCH_ID_BYTES,
+    statType:        STAT_TYPE_BYTES,
+    statValue,
+    txoddsFixtureId: TXODDS_FIXTURE_ID,
+    txoddsSeq:       TXODDS_SEQ,
+    txoddsStatKey:   TXODDS_STAT_KEY,
+  });
+  log.info({ stat_value: statValue, sig }, "submitted.settle");
 }
 
 // ------------------------------------------------------------------
 // Real TxLINE feed (devnet/mainnet)
 // ------------------------------------------------------------------
-async function runRealFeed(history: any[]) {
+async function runRealFeed(history: any[], tabula: TabulaClient | null) {
   if (TXODDS_FIXTURE_ID === 0) {
     throw new Error("USE_REAL_TXLINE=1 requires TXODDS_FIXTURE_ID env var");
   }
@@ -71,16 +150,30 @@ async function runRealFeed(history: any[]) {
 
   let lastProbs: number[] | null = null;
   let lastUpdate = 0;
+  let settled = false;
 
   for await (const raw of client.streamScores()) {
     metrics.txlineFetches.inc({ fixture: String(TXODDS_FIXTURE_ID) });
-    if (Date.now() - lastUpdate < cfg.updateIntervalMs) continue;
-    lastUpdate = Date.now();
-
-    // The real SSE payload includes per-fixture updates. We filter to our
-    // fixture and extract the live-state features the oracle expects.
     const payload = raw as any;
     if (payload?.fixtureId !== TXODDS_FIXTURE_ID) continue;
+
+    // Settle once the fixture reaches full time using the TxLINE-validated
+    // stat value (fail closed: only settle on a value we could validate).
+    const finished = payload.status === "finished" || Number(payload.minute ?? 0) >= 90;
+    if (finished && !settled) {
+      try {
+        const statValue = await resolveFinalStat(client, payload);
+        await submitSettlement(tabula, statValue);
+        settled = true;
+      } catch (e) {
+        metrics.txlineErrors.inc();
+        log.error({ err: String(e) }, "settle.fail");
+      }
+      continue;
+    }
+
+    if (Date.now() - lastUpdate < cfg.updateIntervalMs) continue;
+    lastUpdate = Date.now();
 
     const live = {
       minute:           Number(payload.minute          ?? 0),
@@ -110,11 +203,7 @@ async function runRealFeed(history: any[]) {
       }, "tick");
 
       if (drift > cfg.divergenceThreshold) {
-        // TODO: wire real Anchor call — omitted here so the demo runs
-        // without a deployed program. See docs/DEPLOYMENT.md for the
-        // production wire-up recipe.
-        metrics.predictionsSent.inc({ match: MATCH_ID });
-        log.info({ new_b: p.liquidity_b }, "would.submit.update_prediction");
+        await submitPrediction(tabula, p.probs_q6, p.liquidity_b);
         lastProbs = p.probs_float;
       }
     } catch (e) {
@@ -124,10 +213,31 @@ async function runRealFeed(history: any[]) {
   }
 }
 
+/**
+ * Resolve the definitive full-time stat value from TxLINE. Prefers the
+ * validated stat-validation endpoint (Merkle-backed) and falls back to the
+ * live payload's final count when a seq/statKey are not configured.
+ */
+async function resolveFinalStat(client: TxLineClient, payload: any): Promise<number> {
+  if (TXODDS_SEQ > 0 && TXODDS_STAT_KEY > 0) {
+    const v = await client.fetchStatValidation({
+      fixtureId: TXODDS_FIXTURE_ID,
+      seq:       TXODDS_SEQ,
+      statKey:   TXODDS_STAT_KEY,
+    });
+    return Number(v.statToProve.statValue);
+  }
+  const fallback = Number(payload.cornersH2 ?? payload.cornersSoFar);
+  if (!Number.isFinite(fallback)) {
+    throw new Error("no validated stat and no fallback value in payload");
+  }
+  return fallback;
+}
+
 // ------------------------------------------------------------------
-// Local emulator (localnet, hackathon demo)
+// Local emulator (localnet)
 // ------------------------------------------------------------------
-async function runLocalEmulator(history: any[]) {
+async function runLocalEmulator(history: any[], tabula: TabulaClient | null) {
   const feed = new LocalTxLineEmulator(MATCH_ID, FINAL_CORNERS_H2);
   let lastProbs: number[] | null = null;
   let lastUpdate = 0;
@@ -157,8 +267,7 @@ async function runLocalEmulator(history: any[]) {
       }, "tick");
 
       if (drift > cfg.divergenceThreshold) {
-        metrics.predictionsSent.inc({ match: t.match_id });
-        log.info({ new_b: p.liquidity_b }, "would.submit.update_prediction");
+        await submitPrediction(tabula, p.probs_q6, p.liquidity_b);
         lastProbs = p.probs_float;
       }
     } catch (e) {
@@ -167,11 +276,13 @@ async function runLocalEmulator(history: any[]) {
     }
   });
 
-  feed.on("full_time", (e) => {
-    metrics.settlementsSent.inc({ match: e.match_id });
-    log.info({
-      match_id: e.match_id, corners_h2: e.corners_h2,
-    }, "full_time.settle");
+  feed.on("full_time", async (e) => {
+    try {
+      await submitSettlement(tabula, e.corners_h2);
+      log.info({ match_id: e.match_id, corners_h2: e.corners_h2 }, "full_time.settled");
+    } catch (err) {
+      log.error({ err: String(err) }, "settle.fail");
+    }
   });
 
   feed.start(1_000);

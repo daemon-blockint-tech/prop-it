@@ -10,10 +10,17 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@noble/hashes": "^1.8.0",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/wallet-adapter-base": "^0.9.27",
+    "@solana/wallet-adapter-react": "^0.15.39",
+    "@solana/wallet-adapter-react-ui": "^0.9.39",
+    "@solana/wallet-adapter-wallets": "^0.19.38",
+    "@solana/web3.js": "^1.98.4",
+    "axios": "^1.7.0",
     "next": "14.2.7",
     "react": "18.3.1",
-    "react-dom": "18.3.1",
-    "axios": "^1.7.0"
+    "react-dom": "18.3.1"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
@@ -23,5 +30,11 @@
     "postcss": "^8.4.47",
     "tailwindcss": "^3.4.10",
     "typescript": "^5.6.0"
+  },
+  "overrides": {
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "@types/react": "18.3.31",
+    "@types/react-dom": "18.3.7"
   }
 }
