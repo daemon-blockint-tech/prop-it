@@ -90,8 +90,8 @@ The real TxLINE devnet program is
 - ✅ GitHub Actions: gitleaks, ruff, pytest, tsc, anchor build (mock + real)
 - ✅ Dependabot for npm / pip / cargo / actions
 - ✅ Pre-commit hooks: gitleaks, private-key detector, ruff
+- ✅ Emergency-cancel instruction (`cancel_market` + `claim_refund`) — governance voids an unsettleable market; bettors reclaim full stake
 - ⚠️ External audit — not started, required before any mainnet deploy
-- ⚠️ Emergency-cancel instruction — not yet implemented
 - ⚠️ TabFM ensemble load-testing at ensemble_size=32 — pending
 
 See [`SECURITY.md`](SECURITY.md) for the full threat model and
