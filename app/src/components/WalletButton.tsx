@@ -7,5 +7,5 @@ import dynamic from "next/dynamic";
 export const WalletButton = dynamic(
   async () =>
     (await import("@solana/wallet-adapter-react-ui")).WalletMultiButton,
-  { ssr: false, loading: () => <span className="text-xs text-white/40">wallet…</span> },
+  { ssr: false, loading: () => <span className="text-xs font-semibold text-ink/50">wallet…</span> },
 );

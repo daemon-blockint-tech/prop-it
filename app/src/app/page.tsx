@@ -25,7 +25,7 @@ function oracleErrorMessage(err: unknown): string {
       return `Oracle not reachable at ${ORACLE_URL}. Start the oracle service, then refresh.`;
     }
     if (err.response?.status === 404) {
-      return "Oracle returned 404 — check NEXT_PUBLIC_ORACLE_URL and the /predict route.";
+      return "Oracle returned 404. Check NEXT_PUBLIC_ORACLE_URL and the /predict route.";
     }
     if (err.response?.status === 500) {
       return "Oracle failed on /predict (500). Check oracle logs for model or input errors.";
@@ -113,16 +113,16 @@ export default function Page() {
           loading={busy}
           hasData={!!snap}
         />
-        <div className="rounded-xl border border-white/10 bg-panel p-4 text-xs text-white/60 leading-relaxed">
-          <p className="mb-2 text-white/80 font-semibold">Demo flow</p>
-          <ol className="list-decimal ml-4 space-y-1">
-            <li>TxLINE feeds live match ticks (target ~8–10 ms).</li>
-            <li>TabFM runs on tabular history + live state; keeper calls <code className="text-accent">update_prediction</code>.</li>
-            <li>LMSR reprices; <code>b</code> shrinks when ensemble models disagree.</li>
-            <li>At full time, <code className="text-accent">settle_via_txline</code> checks the Merkle proof and pays USDC.</li>
+        <div className="rounded-blob bg-ink text-cream p-5 shadow-pop border-2 border-ink text-sm leading-relaxed">
+          <p className="mb-3 font-display font-extrabold text-base">How the demo works</p>
+          <ol className="list-decimal ml-4 space-y-2 text-cream/80">
+            <li>An oracle feeds live match ticks (target latency ~8–10 ms).</li>
+            <li>TabFM scores tabular history plus live state; a keeper calls <code className="font-mono text-sun">update_prediction</code>.</li>
+            <li>LMSR reprices the market. Liquidity <code className="font-mono">b</code> shrinks when the ensemble models disagree.</li>
+            <li>At full time, <code className="font-mono text-sun">settle_via_txline</code> checks the Merkle proof and pays out USDC.</li>
           </ol>
-          <p className="mt-3 text-white/40">
-            This page runs steps 2–3 against a local oracle. Bets and settlement are stubbed.
+          <p className="mt-4 text-xs text-cream/50">
+            This page only runs steps 2–3, against a local oracle. Bets and settlement are stubbed.
           </p>
         </div>
       </aside>

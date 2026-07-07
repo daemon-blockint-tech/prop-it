@@ -132,25 +132,6 @@ pub mod tabula_markets {
         Ok(())
     }
 
-    /// Governance emergency-cancel. Moves a *Trading* market to Cancelled so
-    /// stakes can be reclaimed via `claim_refund` when settlement is
-    /// impossible (abandoned fixture, dead oracle, bad market config).
-    /// Refuses to touch an already-Resolved market so payouts can't be
-    /// retroactively voided. Works even while the pool is paused — pausing is
-    /// exactly when an operator needs this lever.
-    pub fn cancel_market(ctx: Context<CancelMarket>) -> Result<()> {
-        require_keys_eq!(
-            ctx.accounts.authority.key(),
-            ctx.accounts.pool.authority,
-            TabulaError::AdminUnauthorized
-        );
-        let market = &mut ctx.accounts.market;
-        require!(market.status == MarketStatus::Trading as u8, TabulaError::NotTrading);
-        market.status = MarketStatus::Cancelled as u8;
-        emit!(MarketCancelled { match_id: market.match_id });
-        Ok(())
-    }
-
     pub fn deposit_liquidity(ctx: Context<DepositLiquidity>, amount: u64) -> Result<()> {
         require!(!ctx.accounts.pool.paused, TabulaError::PoolPaused);
         require!(amount > 0, TabulaError::ZeroAmount);
@@ -536,63 +517,6 @@ pub mod tabula_markets {
     }
 
     // ---------------------------------------------------------------
-    // Refund — reclaim stake from a Cancelled market.
-    // ---------------------------------------------------------------
-    pub fn claim_refund(ctx: Context<ClaimRefund>) -> Result<()> {
-        let position = &mut ctx.accounts.position;
-        require!(!position.claimed, TabulaError::AlreadyClaimed);
-        require_keys_eq!(position.owner, ctx.accounts.bettor.key(), TabulaError::PositionOwnerMismatch);
-
-        let market = &mut ctx.accounts.market;
-        require!(market.status == MarketStatus::Cancelled as u8, TabulaError::MarketNotCancelled);
-
-        // Bettors get their full stake back; the 2% spread is waived on cancel.
-        let refund = position.usdc_in;
-
-        // Debit this position's liability before paying out.
-        let idx = position.outcome_idx as usize;
-        if idx < market.outcome_count as usize && position.shares > 0 {
-            market.q[idx] = market.q[idx].saturating_sub(position.shares as i64);
-            market.exposure = max_outcome_liability(market);
-        }
-        position.claimed = true;
-
-        // Reverse the accrued fee for this stake so LP-claimable fees never
-        // include activity on a voided market.
-        let fee = refund
-            .checked_mul(FEE_BPS as u64)
-            .and_then(|v| v.checked_div(10_000u64))
-            .unwrap_or(0);
-        ctx.accounts.pool.fees_accrued = ctx.accounts.pool.fees_accrued.saturating_sub(fee);
-
-        if refund > 0 {
-            require!(
-                ctx.accounts.vault.amount >= refund,
-                TabulaError::InsufficientVaultLiquidity
-            );
-            let pool_key = ctx.accounts.pool.key();
-            let seeds: &[&[u8]] = &[b"vault-auth", pool_key.as_ref(), &[ctx.bumps.vault_authority]];
-            let signer = &[seeds];
-            let cpi = CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from:      ctx.accounts.vault.to_account_info(),
-                    to:        ctx.accounts.bettor_token_account.to_account_info(),
-                    authority: ctx.accounts.vault_authority.to_account_info(),
-                },
-                signer,
-            );
-            token::transfer(cpi, refund)?;
-        }
-
-        emit!(RefundClaimed {
-            owner:  position.owner,
-            refund,
-        });
-        Ok(())
-    }
-
-    // ---------------------------------------------------------------
     // Keeper posts a one-shot attestation bound to (pool, market).
     // ---------------------------------------------------------------
     pub fn post_tx_line_attestation(
@@ -760,20 +684,6 @@ pub struct AdminOnly<'info> {
 
     #[account(mut, seeds = [b"pool", pool.usdc_mint.as_ref()], bump = pool.bump)]
     pub pool: Account<'info, Pool>,
-}
-
-#[derive(Accounts)]
-pub struct CancelMarket<'info> {
-    pub authority: Signer<'info>,
-
-    #[account(seeds = [b"pool", pool.usdc_mint.as_ref()], bump = pool.bump)]
-    pub pool: Account<'info, Pool>,
-
-    #[account(mut,
-        seeds = [b"market", pool.key().as_ref(), market.match_id.as_ref()],
-        bump  = market.bump,
-        constraint = market.pool == pool.key() @ TabulaError::MarketPoolMismatch)]
-    pub market: Account<'info, Market>,
 }
 
 #[derive(Accounts)]
@@ -991,41 +901,6 @@ pub struct ClaimWinnings<'info> {
     pub token_program: Program<'info, Token>,
 }
 
-#[derive(Accounts)]
-pub struct ClaimRefund<'info> {
-    #[account(mut)]
-    pub bettor: Signer<'info>,
-
-    #[account(mut, seeds = [b"pool", pool.usdc_mint.as_ref()], bump = pool.bump)]
-    pub pool: Account<'info, Pool>,
-
-    #[account(mut,
-        seeds = [b"market", pool.key().as_ref(), market.match_id.as_ref()],
-        bump  = market.bump,
-        constraint = market.pool == pool.key() @ TabulaError::MarketPoolMismatch)]
-    pub market: Account<'info, Market>,
-
-    #[account(mut,
-        seeds = [b"position", market.key().as_ref(), bettor.key().as_ref()],
-        bump  = position.bump,
-        constraint = position.owner == bettor.key())]
-    pub position: Account<'info, Position>,
-
-    #[account(mut,
-        constraint = bettor_token_account.mint  == pool.usdc_mint,
-        constraint = bettor_token_account.owner == bettor.key())]
-    pub bettor_token_account: Account<'info, TokenAccount>,
-
-    #[account(mut, seeds = [b"vault", pool.key().as_ref()], bump = pool.vault_bump)]
-    pub vault: Account<'info, TokenAccount>,
-
-    /// CHECK: PDA authority for vault
-    #[account(seeds = [b"vault-auth", pool.key().as_ref()], bump)]
-    pub vault_authority: UncheckedAccount<'info>,
-
-    pub token_program: Program<'info, Token>,
-}
-
 // ---------------------------------------------------------------
 // State
 // ---------------------------------------------------------------
@@ -1127,8 +1002,6 @@ pub enum MarketStatus { Trading = 0, Resolved = 1, Cancelled = 2 }
 #[event] pub struct BetPlaced         { pub match_id: [u8;32], pub outcome_idx: u8, pub usdc_amount: u64, pub shares: u64, pub price_scaled: u64 }
 #[event] pub struct MarketResolved    { pub match_id: [u8;32], pub stat_value: u64, pub winning_outcome: u8 }
 #[event] pub struct WinningsClaimed   { pub owner: Pubkey, pub payout: u64 }
-#[event] pub struct MarketCancelled   { pub match_id: [u8;32] }
-#[event] pub struct RefundClaimed     { pub owner: Pubkey, pub refund: u64 }
 #[event] pub struct PoolPauseToggled  { pub paused: bool }
 #[event] pub struct OracleRotated     { pub new_prediction_oracle: Pubkey, pub new_settlement_oracle: Pubkey }
 #[event] pub struct AttestationPosted { pub match_id: [u8;32], pub stat_value: u64 }
@@ -1149,7 +1022,6 @@ pub enum TabulaError {
     #[msg("Market is not in Trading state")]                  NotTrading,
     #[msg("Market already settled")]                          AlreadySettled,
     #[msg("Market not resolved yet")]                         NotResolved,
-    #[msg("Market is not cancelled")]                         MarketNotCancelled,
     #[msg("Position already claimed")]                        AlreadyClaimed,
     #[msg("Position owner mismatch")]                         PositionOwnerMismatch,
     #[msg("Stat type mismatch")]                              StatTypeMismatch,

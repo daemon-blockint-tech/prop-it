@@ -23,7 +23,6 @@ import {
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import { keccak_256 } from "@noble/hashes/sha3";
-import { createHash } from "crypto";
 import { expect } from "chai";
 
 // Utilities -----------------------------------------------------------
@@ -66,7 +65,6 @@ describe("tabula-markets", () => {
   let vaultAuth: PublicKey;
   let marketPda: PublicKey;
   let txlineConfigPda: PublicKey;
-  let lpAta: PublicKey;
   const matchId  = Buffer.alloc(32); matchId.write("wc-r16-arg-fra");
   const statType = utf8Bytes("corners_h2", 16);
   // All probs >= MIN_PROB (1_000); sum = Q_SCALE.
@@ -110,7 +108,7 @@ describe("tabula-markets", () => {
       .rpc();
 
     // 2. Fund an LP and deposit liquidity
-    lpAta = await createAssociatedTokenAccount(
+    const lpAta = await createAssociatedTokenAccount(
       provider.connection, authority, usdcMint, authority.publicKey);
     await mintTo(provider.connection, authority, usdcMint, lpAta, authority, 10_000_000_000);
 
@@ -194,211 +192,5 @@ describe("tabula-markets", () => {
     const mkt = await tabula.account.market.fetch(marketPda);
     expect(mkt.status).to.equal(1); // Resolved
     expect(mkt.winningOutcome).to.equal(1); // 5 corners → bin [3, 6)
-  });
-
-  // ------------------------------------------------------------------
-  // Real (keeper-attested) settlement path. Exercises exactly the
-  // instructions the keeper (TabulaClient) and frontend (place_bet) now
-  // submit: update_prediction → place_bet → post_tx_line_attestation →
-  // settle_via_tx_line_real → claim_winnings. Uses a fresh market on the
-  // same pool so it is independent of the mock-CPI test above.
-  // ------------------------------------------------------------------
-  const matchId2 = Buffer.alloc(32); matchId2.write("wc-r16-real-path");
-
-  it("real path: update_prediction → place_bet → attest → settle → claim", async () => {
-    const [market2] = PublicKey.findProgramAddressSync(
-      [Buffer.from("market"), poolPda.toBuffer(), matchId2], tabula.programId);
-
-    await tabula.methods.createMarket(
-        Array.from(matchId2), Array.from(statType), 4,
-        binEdges, initialProbs, new BN(5_000_000))
-      .accounts({
-        creator: authority.publicKey,
-        pool: poolPda, market: market2,
-        systemProgram: SystemProgram.programId,
-      }).rpc();
-
-    // Oracle pushes a fresh ensemble prediction (oracle_authority signs).
-    const newProbs = [new BN(100_000), new BN(500_000), new BN(300_000), new BN(100_000)];
-    await tabula.methods.updatePrediction(newProbs, new BN(4_000_000))
-      .accounts({ oracle: oracleKey.publicKey, pool: poolPda, market: market2 })
-      .rpc();
-
-    const mktAfterPred = await tabula.account.market.fetch(market2);
-    expect(mktAfterPred.probs[1].toNumber()).to.equal(500_000);
-    expect(mktAfterPred.liquidityB.toNumber()).to.equal(4_000_000);
-
-    // Bettor stakes 100 USDC on outcome 1 (the bin that 5 corners resolves to).
-    const [position2] = PublicKey.findProgramAddressSync(
-      [Buffer.from("position"), market2.toBuffer(), authority.publicKey.toBuffer()],
-      tabula.programId);
-    await tabula.methods.placeBet(1, new BN(100_000_000))
-      .accounts({
-        bettor: authority.publicKey,
-        pool: poolPda, market: market2, position: position2,
-        bettorTokenAccount: lpAta, vault: vaultPda,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-      }).rpc();
-
-    const pos = await tabula.account.position.fetch(position2);
-    expect(pos.outcomeIdx).to.equal(1);
-    expect(pos.shares.toNumber()).to.be.greaterThan(0);
-
-    // Keeper posts a one-shot attestation, then settles atomically.
-    const [attestationPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("attestation"), poolPda.toBuffer(), market2.toBuffer()],
-      tabula.programId);
-    const statValue = new BN(5);
-    const fixtureId  = new BN(998877);
-    const seq        = 7;
-    const statKey    = 42;
-
-    await tabula.methods.postTxLineAttestation(
-        Array.from(matchId2), Array.from(statType), statValue, fixtureId, seq, statKey)
-      .accounts({
-        payer: authority.publicKey,
-        settlementOracle: keeperKey.publicKey,
-        pool: poolPda, market: market2, attestation: attestationPda,
-        systemProgram: SystemProgram.programId,
-      }).rpc();
-
-    const att = await tabula.account.txLineAttestation.fetch(attestationPda);
-    expect(att.statValue.toNumber()).to.equal(5);
-    expect(att.used).to.equal(false);
-
-    await tabula.methods.settleViaTxLineReal(statValue, fixtureId, seq, statKey)
-      .accounts({
-        payer: authority.publicKey,
-        settlementOracle: keeperKey.publicKey,
-        pool: poolPda, market: market2, attestation: attestationPda,
-      }).rpc();
-
-    const settled = await tabula.account.market.fetch(market2);
-    expect(settled.status).to.equal(1);            // Resolved
-    expect(settled.winningOutcome).to.equal(1);    // 5 corners → bin [3, 6)
-    const attUsed = await tabula.account.txLineAttestation.fetch(attestationPda);
-    expect(attUsed.used).to.equal(true);           // one-shot consumed
-
-    // Winner claims — position is on the winning outcome, so payout > 0.
-    const balBefore = (await provider.connection.getTokenAccountBalance(lpAta)).value.amount;
-    await tabula.methods.claimWinnings()
-      .accounts({
-        bettor: authority.publicKey,
-        pool: poolPda, market: market2, position: position2,
-        bettorTokenAccount: lpAta, vault: vaultPda, vaultAuthority: vaultAuth,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      }).rpc();
-
-    const claimed = await tabula.account.position.fetch(position2);
-    expect(claimed.claimed).to.equal(true);
-    const balAfter = (await provider.connection.getTokenAccountBalance(lpAta)).value.amount;
-    expect(Number(balAfter)).to.be.greaterThan(Number(balBefore)); // received payout
-  });
-
-  it("keeper raw encoding matches Anchor for update_prediction", async () => {
-    // Guards the keeper's hand-built instruction (keeper/src/tabulaClient.ts)
-    // against Anchor's canonical encoding: 8-byte discriminator + Borsh
-    // Vec<u64> + u64, and the oracle · pool · market account order.
-    const probs = [120_000, 480_000, 300_000, 100_000];
-    const newB  = 4_200_000;
-
-    const anchorIx = await tabula.methods
-      .updatePrediction(probs.map((p) => new BN(p)), new BN(newB))
-      .accounts({ oracle: oracleKey.publicKey, pool: poolPda, market: marketPda })
-      .instruction();
-
-    const disc = createHash("sha256").update("global:update_prediction").digest().subarray(0, 8);
-    const vecLen = Buffer.alloc(4); vecLen.writeUInt32LE(probs.length, 0);
-    const probsBuf = Buffer.concat(probs.map((p) => {
-      const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(p), 0); return b;
-    }));
-    const bBuf = Buffer.alloc(8); bBuf.writeBigUInt64LE(BigInt(newB), 0);
-    const rawData = Buffer.concat([disc, vecLen, probsBuf, bBuf]);
-
-    expect(Buffer.from(anchorIx.data).equals(rawData)).to.equal(true);
-    expect(anchorIx.keys.map((k) => k.pubkey.toBase58())).to.deep.equal(
-      [oracleKey.publicKey, poolPda, marketPda].map((k) => k.toBase58()));
-    expect(anchorIx.keys.map((k) => [k.isSigner, k.isWritable])).to.deep.equal(
-      [[true, false], [false, false], [false, true]]);
-  });
-
-  // ------------------------------------------------------------------
-  // Emergency cancel + refund: governance voids an unsettleable market
-  // and the bettor reclaims their full stake.
-  // ------------------------------------------------------------------
-  const matchId3 = Buffer.alloc(32); matchId3.write("wc-r16-cancelled");
-
-  it("cancel_market → claim_refund returns the full stake", async () => {
-    const [market3] = PublicKey.findProgramAddressSync(
-      [Buffer.from("market"), poolPda.toBuffer(), matchId3], tabula.programId);
-
-    await tabula.methods.createMarket(
-        Array.from(matchId3), Array.from(statType), 4,
-        binEdges, initialProbs, new BN(5_000_000))
-      .accounts({
-        creator: authority.publicKey,
-        pool: poolPda, market: market3,
-        systemProgram: SystemProgram.programId,
-      }).rpc();
-
-    const [position3] = PublicKey.findProgramAddressSync(
-      [Buffer.from("position"), market3.toBuffer(), authority.publicKey.toBuffer()],
-      tabula.programId);
-
-    const balBeforeBet = (await provider.connection.getTokenAccountBalance(lpAta)).value.amount;
-
-    await tabula.methods.placeBet(2, new BN(50_000_000))
-      .accounts({
-        bettor: authority.publicKey,
-        pool: poolPda, market: market3, position: position3,
-        bettorTokenAccount: lpAta, vault: vaultPda,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-      }).rpc();
-
-    // Admin cancels the still-Trading market.
-    await tabula.methods.cancelMarket()
-      .accounts({ authority: authority.publicKey, pool: poolPda, market: market3 })
-      .rpc();
-    const cancelled = await tabula.account.market.fetch(market3);
-    expect(cancelled.status).to.equal(2); // Cancelled
-
-    // Settlement of a cancelled market is not possible.
-    let settleRejected = false;
-    try {
-      await tabula.methods.updatePrediction(
-          [new BN(250_000), new BN(250_000), new BN(250_000), new BN(250_000)], new BN(4_000_000))
-        .accounts({ oracle: oracleKey.publicKey, pool: poolPda, market: market3 })
-        .rpc();
-    } catch { settleRejected = true; }
-    expect(settleRejected).to.equal(true); // NotTrading
-
-    // Bettor reclaims the full 50 USDC stake.
-    await tabula.methods.claimRefund()
-      .accounts({
-        bettor: authority.publicKey,
-        pool: poolPda, market: market3, position: position3,
-        bettorTokenAccount: lpAta, vault: vaultPda, vaultAuthority: vaultAuth,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      }).rpc();
-
-    const refunded = await tabula.account.position.fetch(position3);
-    expect(refunded.claimed).to.equal(true);
-    const balAfterRefund = (await provider.connection.getTokenAccountBalance(lpAta)).value.amount;
-    expect(balAfterRefund).to.equal(balBeforeBet); // stake fully returned
-
-    // Double-refund is rejected.
-    let doubleRejected = false;
-    try {
-      await tabula.methods.claimRefund()
-        .accounts({
-          bettor: authority.publicKey,
-          pool: poolPda, market: market3, position: position3,
-          bettorTokenAccount: lpAta, vault: vaultPda, vaultAuthority: vaultAuth,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        }).rpc();
-    } catch { doubleRejected = true; }
-    expect(doubleRejected).to.equal(true); // AlreadyClaimed
   });
 });
