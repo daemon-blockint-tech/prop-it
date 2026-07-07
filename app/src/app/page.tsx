@@ -2,20 +2,13 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import axios from "axios";
-import { Transaction } from "@solana/web3.js";
-import { useConnection, useWallet } from "@solana/wallet-adapter-react";
-import { useWalletModal } from "@solana/wallet-adapter-react-ui";
 import { MarketPanel } from "@/components/MarketPanel";
 import { ReceiptPanel } from "@/components/ReceiptPanel";
 import { OracleStatus } from "@/components/OracleStatus";
-import { placeBetIx, encodeFixedBytes } from "@/lib/tabula";
 
 const BIN_EDGES = [0, 3, 6, 9, 999];
 const BIN_LABELS = ["0–2 corners", "3–5 corners", "6–8 corners", "9+ corners"];
 const ORACLE_URL = process.env.NEXT_PUBLIC_ORACLE_URL ?? "http://127.0.0.1:8787";
-const MATCH_ID = "world-cup-2026-r16-arg-vs-fra";
-const STAT_TYPE = "corners_h2";
-const USDC_DECIMALS = 6;
 
 interface Snapshot {
   probs: number[];
@@ -26,52 +19,40 @@ interface Snapshot {
   minute: number;
 }
 
+function oracleErrorMessage(err: unknown): string {
+  if (axios.isAxiosError(err)) {
+    if (err.code === "ERR_NETWORK" || err.message === "Network Error") {
+      return `Oracle not reachable at ${ORACLE_URL}. Start the oracle service, then refresh.`;
+    }
+    if (err.response?.status === 404) {
+      return "Oracle returned 404 — check NEXT_PUBLIC_ORACLE_URL and the /predict route.";
+    }
+    if (err.response?.status === 500) {
+      return "Oracle failed on /predict (500). Check oracle logs for model or input errors.";
+    }
+    if (err.response?.status) {
+      return `Oracle error ${err.response.status}: ${err.response.statusText || "request failed"}.`;
+    }
+    return err.message || "Oracle request failed.";
+  }
+  if (err instanceof Error) return err.message;
+  return "Oracle request failed.";
+}
+
 export default function Page() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [minute, setMinute] = useState(47);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [betStatus, setBetStatus] = useState<string | null>(null);
-  const [betting, setBetting] = useState(false);
-
-  const { connection } = useConnection();
-  const { publicKey, sendTransaction } = useWallet();
-  const { setVisible } = useWalletModal();
 
   const priceWithFee = useMemo(() => {
     if (!snap) return [];
     return snap.probs.map((p) => p * 1.02); // 2% spread mirroring FEE_BPS on-chain
   }, [snap]);
 
-  async function placeBet(outcomeIdx: number, stakeUsdc: number) {
-    if (!publicKey) {
-      setVisible(true);
-      return;
-    }
-    if (!(stakeUsdc > 0)) {
-      setBetStatus("enter a stake greater than 0");
-      return;
-    }
-    setBetting(true);
-    setBetStatus(`submitting bet on “${BIN_LABELS[outcomeIdx]}”…`);
-    try {
-      const matchId = encodeFixedBytes(MATCH_ID, 32);
-      const usdcAmount = BigInt(Math.round(stakeUsdc * 10 ** USDC_DECIMALS));
-      const ix = placeBetIx({ bettor: publicKey, matchId, outcomeIdx, usdcAmount });
-      const tx = new Transaction().add(ix);
-      const sig = await sendTransaction(tx, connection);
-      setBetStatus(`confirming ${sig.slice(0, 8)}…`);
-      await connection.confirmTransaction(sig, "confirmed");
-      setBetStatus(`bet confirmed: ${sig}`);
-    } catch (e: any) {
-      setBetStatus(`bet failed: ${e?.message ?? String(e)}`);
-    } finally {
-      setBetting(false);
-    }
-  }
-
   async function fetchPrediction(atMinute: number) {
-    setBusy(true); setError(null);
+    setBusy(true);
+    setError(null);
     try {
       const { data } = await axios.post(`${ORACLE_URL}/predict`, {
         match_id: "world-cup-2026-r16-arg-vs-fra",
@@ -95,8 +76,8 @@ export default function Page() {
         backend: data.model_backend,
         minute: atMinute,
       });
-    } catch (e: any) {
-      setError(e?.message ?? "oracle unavailable");
+    } catch (e) {
+      setError(oracleErrorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -116,29 +97,33 @@ export default function Page() {
           minute={minute}
           onMinuteChange={(m) => { setMinute(m); fetchPrediction(m); }}
           busy={busy}
-          walletConnected={!!publicKey}
-          onBet={placeBet}
-          betting={betting}
-          betStatus={betStatus}
+          hasData={!!snap}
         />
-        <ReceiptPanel matchId={MATCH_ID} statType={STAT_TYPE} />
+        <ReceiptPanel
+          matchId="world-cup-2026-r16-arg-vs-fra"
+          statType="corners_h2"
+        />
       </section>
       <aside className="space-y-6">
         <OracleStatus
-          backend={snap?.backend ?? "…"}
-          latencyMs={snap?.latencyMs ?? 0}
-          divergence={snap?.divergence ?? 0}
+          backend={snap?.backend}
+          latencyMs={snap?.latencyMs}
+          divergence={snap?.divergence}
           error={error}
+          loading={busy}
+          hasData={!!snap}
         />
         <div className="rounded-xl border border-white/10 bg-panel p-4 text-xs text-white/60 leading-relaxed">
-          <p className="mb-2 text-white/80 font-semibold">How it works</p>
+          <p className="mb-2 text-white/80 font-semibold">Demo flow</p>
           <ol className="list-decimal ml-4 space-y-1">
-            <li>TxLINE streams live match ticks (8–10ms latency).</li>
-            <li>TabFM ensemble runs zero-shot in-context on tabular history + live state.</li>
-            <li>Keeper submits <code className="text-accent">update_prediction</code> on Solana.</li>
-            <li>LMSR curve recentres on the new probabilities; <code>b</code> shrinks when the ensemble disagrees.</li>
-            <li>At full time, <code className="text-accent">settle_via_txline</code> CPI verifies the Merkle proof and pays winners in USDC.</li>
+            <li>TxLINE feeds live match ticks (target ~8–10 ms).</li>
+            <li>TabFM runs on tabular history + live state; keeper calls <code className="text-accent">update_prediction</code>.</li>
+            <li>LMSR reprices; <code>b</code> shrinks when ensemble models disagree.</li>
+            <li>At full time, <code className="text-accent">settle_via_txline</code> checks the Merkle proof and pays USDC.</li>
           </ol>
+          <p className="mt-3 text-white/40">
+            This page runs steps 2–3 against a local oracle. Bets and settlement are stubbed.
+          </p>
         </div>
       </aside>
     </div>

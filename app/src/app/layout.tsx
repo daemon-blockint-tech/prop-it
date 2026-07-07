@@ -6,7 +6,7 @@ import { WalletButton } from "@/components/WalletButton";
 
 export const metadata: Metadata = {
   title: "TabulaMarkets",
-  description: "AI-Driven AMM and Cryptographic Solana Settlement for Dynamic Prop Bets",
+  description: "Devnet demo — TabFM oracle, LMSR prop market, TxLINE settlement stub",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -20,16 +20,16 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 <h1 className="text-xl font-bold tracking-tight">
                   Tabula<span className="text-accent">Markets</span>
                 </h1>
-                <p className="text-xs text-white/50">
-                  AI-driven prop-bet AMM · Solana devnet · TxLINE settled
-                </p>
+              <p className="text-xs text-white/50">
+                Prop market demo · Solana devnet · bets not wired
+              </p>
               </div>
               <WalletButton />
             </header>
             {children}
-            <footer className="mt-16 pt-6 border-t border-white/10 text-xs text-white/40">
-              Not for use with real funds · devnet only · Apache-2.0
-            </footer>
+          <footer className="mt-16 pt-6 border-t border-white/10 text-xs text-white/40">
+            No real money · devnet only · Apache-2.0
+          </footer>
           </div>
         </SolanaProviders>
       </body>
