@@ -322,4 +322,83 @@ describe("tabula-markets", () => {
     expect(anchorIx.keys.map((k) => [k.isSigner, k.isWritable])).to.deep.equal(
       [[true, false], [false, false], [false, true]]);
   });
+
+  // ------------------------------------------------------------------
+  // Emergency cancel + refund: governance voids an unsettleable market
+  // and the bettor reclaims their full stake.
+  // ------------------------------------------------------------------
+  const matchId3 = Buffer.alloc(32); matchId3.write("wc-r16-cancelled");
+
+  it("cancel_market → claim_refund returns the full stake", async () => {
+    const [market3] = PublicKey.findProgramAddressSync(
+      [Buffer.from("market"), poolPda.toBuffer(), matchId3], tabula.programId);
+
+    await tabula.methods.createMarket(
+        Array.from(matchId3), Array.from(statType), 4,
+        binEdges, initialProbs, new BN(5_000_000))
+      .accounts({
+        creator: authority.publicKey,
+        pool: poolPda, market: market3,
+        systemProgram: SystemProgram.programId,
+      }).rpc();
+
+    const [position3] = PublicKey.findProgramAddressSync(
+      [Buffer.from("position"), market3.toBuffer(), authority.publicKey.toBuffer()],
+      tabula.programId);
+
+    const balBeforeBet = (await provider.connection.getTokenAccountBalance(lpAta)).value.amount;
+
+    await tabula.methods.placeBet(2, new BN(50_000_000))
+      .accounts({
+        bettor: authority.publicKey,
+        pool: poolPda, market: market3, position: position3,
+        bettorTokenAccount: lpAta, vault: vaultPda,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+      }).rpc();
+
+    // Admin cancels the still-Trading market.
+    await tabula.methods.cancelMarket()
+      .accounts({ authority: authority.publicKey, pool: poolPda, market: market3 })
+      .rpc();
+    const cancelled = await tabula.account.market.fetch(market3);
+    expect(cancelled.status).to.equal(2); // Cancelled
+
+    // Settlement of a cancelled market is not possible.
+    let settleRejected = false;
+    try {
+      await tabula.methods.updatePrediction(
+          [new BN(250_000), new BN(250_000), new BN(250_000), new BN(250_000)], new BN(4_000_000))
+        .accounts({ oracle: oracleKey.publicKey, pool: poolPda, market: market3 })
+        .rpc();
+    } catch { settleRejected = true; }
+    expect(settleRejected).to.equal(true); // NotTrading
+
+    // Bettor reclaims the full 50 USDC stake.
+    await tabula.methods.claimRefund()
+      .accounts({
+        bettor: authority.publicKey,
+        pool: poolPda, market: market3, position: position3,
+        bettorTokenAccount: lpAta, vault: vaultPda, vaultAuthority: vaultAuth,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).rpc();
+
+    const refunded = await tabula.account.position.fetch(position3);
+    expect(refunded.claimed).to.equal(true);
+    const balAfterRefund = (await provider.connection.getTokenAccountBalance(lpAta)).value.amount;
+    expect(balAfterRefund).to.equal(balBeforeBet); // stake fully returned
+
+    // Double-refund is rejected.
+    let doubleRejected = false;
+    try {
+      await tabula.methods.claimRefund()
+        .accounts({
+          bettor: authority.publicKey,
+          pool: poolPda, market: market3, position: position3,
+          bettorTokenAccount: lpAta, vault: vaultPda, vaultAuthority: vaultAuth,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        }).rpc();
+    } catch { doubleRejected = true; }
+    expect(doubleRejected).to.equal(true); // AlreadyClaimed
+  });
 });
