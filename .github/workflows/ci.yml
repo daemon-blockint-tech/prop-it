@@ -88,11 +88,15 @@ jobs:
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/v1.18.26/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
-      # Use current stable (not a pinned toolchain): the Anchor CLI install
-      # pulls transitive crates that now require the `edition2024` cargo
-      # feature (Rust 1.85+), which the previously-pinned 1.79 could not parse.
-      # `anchor build` itself uses Solana's own platform-tools rust, so the
-      # host toolchain only affects the CLI install + `cargo check` below.
+      # Two toolchains, because their requirements conflict:
+      #   1. Installing anchor-cli needs a MODERN cargo — its transitive deps
+      #      now require the `edition2024` feature (Rust 1.85+), which the old
+      #      pinned 1.79 could not parse.
+      #   2. `anchor build` regenerates the workspace Cargo.lock with the host
+      #      cargo; that lock is then read by Solana's platform-tools cargo
+      #      (1.75), which only understands lockfile v3. Cargo writes v4 by
+      #      default since 1.83, so the build host cargo must be < 1.83.
+      # So: install the CLI on stable, then pin 1.79 for the build steps.
       - uses: dtolnay/rust-toolchain@stable
       # No `--locked`: anchor-cli 0.30.1's pinned lockfile carries `time
       # 0.3.29`, which fails to compile on modern rustc (E0282, fixed in
@@ -101,6 +105,10 @@ jobs:
       # 0.30.1 (pinned by --tag); only its build-time deps float.
       - name: Install Anchor CLI
         run: cargo install --git https://github.com/coral-xyz/anchor --tag v0.30.1 anchor-cli
+      # Switch to 1.79 so the workspace Cargo.lock is written as v3 (readable
+      # by platform-tools cargo 1.75). anchor build's real compile uses the
+      # SBF toolchain regardless; 1.79 only drives IDL/lock generation here.
+      - uses: dtolnay/rust-toolchain@1.79.0
       - name: Build (mock-txline)
         run: anchor build
       - name: Build (real-txline)
