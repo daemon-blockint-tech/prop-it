@@ -94,8 +94,13 @@ jobs:
       # `anchor build` itself uses Solana's own platform-tools rust, so the
       # host toolchain only affects the CLI install + `cargo check` below.
       - uses: dtolnay/rust-toolchain@stable
+      # No `--locked`: anchor-cli 0.30.1's pinned lockfile carries `time
+      # 0.3.29`, which fails to compile on modern rustc (E0282, fixed in
+      # time >=0.3.35). Letting cargo resolve fresh, semver-compatible build
+      # deps pulls a newer `time` that builds on stable. The CLI is still
+      # 0.30.1 (pinned by --tag); only its build-time deps float.
       - name: Install Anchor CLI
-        run: cargo install --git https://github.com/coral-xyz/anchor --tag v0.30.1 anchor-cli --locked
+        run: cargo install --git https://github.com/coral-xyz/anchor --tag v0.30.1 anchor-cli
       - name: Build (mock-txline)
         run: anchor build
       - name: Build (real-txline)
