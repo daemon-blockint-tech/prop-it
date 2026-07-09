@@ -88,8 +88,12 @@ jobs:
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/v1.18.26/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
-      - uses: actions-rs/toolchain@v1
-        with: { toolchain: "1.79", profile: minimal, override: true }
+      # Use current stable (not a pinned toolchain): the Anchor CLI install
+      # pulls transitive crates that now require the `edition2024` cargo
+      # feature (Rust 1.85+), which the previously-pinned 1.79 could not parse.
+      # `anchor build` itself uses Solana's own platform-tools rust, so the
+      # host toolchain only affects the CLI install + `cargo check` below.
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install Anchor CLI
         run: cargo install --git https://github.com/coral-xyz/anchor --tag v0.30.1 anchor-cli --locked
       - name: Build (mock-txline)
