@@ -21,7 +21,7 @@
     "ws":                        "^8.18.0"
   },
   "devDependencies": {
-    "@types/node":               "^20.14.0",
+    "@types/node":               "^26.1.1",
     "@types/ws":                 "^8.5.10",
     "tsx":                       "^4.19.0",
     "typescript":                "^5.6.0"
